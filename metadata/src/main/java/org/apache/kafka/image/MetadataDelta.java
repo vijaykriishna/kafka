@@ -17,6 +17,7 @@
 
 package org.apache.kafka.image;
 
+import org.apache.kafka.common.metadata.AccessControlEntryRecord;
 import org.apache.kafka.common.metadata.BrokerRegistrationChangeRecord;
 import org.apache.kafka.common.metadata.ClientQuotaRecord;
 import org.apache.kafka.common.metadata.ConfigRecord;
@@ -27,7 +28,7 @@ import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.ProducerIdsRecord;
 import org.apache.kafka.common.metadata.RegisterBrokerRecord;
-import org.apache.kafka.common.metadata.RemoveFeatureLevelRecord;
+import org.apache.kafka.common.metadata.RemoveAccessControlEntryRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
@@ -35,9 +36,11 @@ import org.apache.kafka.common.metadata.UnregisterBrokerRecord;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.raft.OffsetAndEpoch;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.MetadataVersion;
 
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 
 
 /**
@@ -63,6 +66,8 @@ public final class MetadataDelta {
     private ClientQuotasDelta clientQuotasDelta = null;
 
     private ProducerIdsDelta producerIdsDelta = null;
+
+    private AclsDelta aclsDelta = null;
 
     public MetadataDelta(MetadataImage image) {
         this.image = image;
@@ -130,6 +135,23 @@ public final class MetadataDelta {
         return producerIdsDelta;
     }
 
+    public AclsDelta aclsDelta() {
+        return aclsDelta;
+    }
+
+    public AclsDelta getOrCreateAclsDelta() {
+        if (aclsDelta == null) aclsDelta = new AclsDelta(image.acls());
+        return aclsDelta;
+    }
+
+    public Optional<MetadataVersion> metadataVersionChanged() {
+        if (featuresDelta == null) {
+            return Optional.empty();
+        } else {
+            return featuresDelta.metadataVersionChange();
+        }
+    }
+
     public void read(long highestOffset, int highestEpoch, Iterator<List<ApiMessageAndVersion>> reader) {
         while (reader.hasNext()) {
             List<ApiMessageAndVersion> batch = reader.next();
@@ -181,11 +203,19 @@ public final class MetadataDelta {
             case PRODUCER_IDS_RECORD:
                 replay((ProducerIdsRecord) record);
                 break;
-            case REMOVE_FEATURE_LEVEL_RECORD:
-                replay((RemoveFeatureLevelRecord) record);
-                break;
             case BROKER_REGISTRATION_CHANGE_RECORD:
                 replay((BrokerRegistrationChangeRecord) record);
+                break;
+            case ACCESS_CONTROL_ENTRY_RECORD:
+                replay((AccessControlEntryRecord) record);
+                break;
+            case REMOVE_ACCESS_CONTROL_ENTRY_RECORD:
+                replay((RemoveAccessControlEntryRecord) record);
+                break;
+            case NO_OP_RECORD:
+                /* NoOpRecord is an empty record and doesn't need to be replayed beyond
+                 * updating the highest offset and epoch.
+                 */
                 break;
             default:
                 throw new RuntimeException("Unknown metadata record type " + type);
@@ -234,6 +264,15 @@ public final class MetadataDelta {
 
     public void replay(FeatureLevelRecord record) {
         getOrCreateFeaturesDelta().replay(record);
+        featuresDelta.metadataVersionChange().ifPresent(changedMetadataVersion -> {
+            // If any feature flags change, need to immediately check if any metadata needs to be downgraded.
+            getOrCreateClusterDelta().handleMetadataVersionChange(changedMetadataVersion);
+            getOrCreateConfigsDelta().handleMetadataVersionChange(changedMetadataVersion);
+            getOrCreateTopicsDelta().handleMetadataVersionChange(changedMetadataVersion);
+            getOrCreateClientQuotasDelta().handleMetadataVersionChange(changedMetadataVersion);
+            getOrCreateProducerIdsDelta().handleMetadataVersionChange(changedMetadataVersion);
+            getOrCreateAclsDelta().handleMetadataVersionChange(changedMetadataVersion);
+        });
     }
 
     public void replay(BrokerRegistrationChangeRecord record) {
@@ -248,8 +287,12 @@ public final class MetadataDelta {
         getOrCreateProducerIdsDelta().replay(record);
     }
 
-    public void replay(RemoveFeatureLevelRecord record) {
-        getOrCreateFeaturesDelta().replay(record);
+    public void replay(AccessControlEntryRecord record) {
+        getOrCreateAclsDelta().replay(record);
+    }
+
+    public void replay(RemoveAccessControlEntryRecord record) {
+        getOrCreateAclsDelta().replay(record);
     }
 
     /**
@@ -263,6 +306,7 @@ public final class MetadataDelta {
         getOrCreateConfigsDelta().finishSnapshot();
         getOrCreateClientQuotasDelta().finishSnapshot();
         getOrCreateProducerIdsDelta().finishSnapshot();
+        getOrCreateAclsDelta().finishSnapshot();
     }
 
     public MetadataImage apply() {
@@ -302,6 +346,12 @@ public final class MetadataDelta {
         } else {
             newProducerIds = producerIdsDelta.apply();
         }
+        AclsImage newAcls;
+        if (aclsDelta == null) {
+            newAcls = image.acls();
+        } else {
+            newAcls = aclsDelta.apply();
+        }
         return new MetadataImage(
             new OffsetAndEpoch(highestOffset, highestEpoch),
             newFeatures,
@@ -309,7 +359,8 @@ public final class MetadataDelta {
             newTopics,
             newConfigs,
             newClientQuotas,
-            newProducerIds
+            newProducerIds,
+            newAcls
         );
     }
 
@@ -324,6 +375,7 @@ public final class MetadataDelta {
             ", configsDelta=" + configsDelta +
             ", clientQuotasDelta=" + clientQuotasDelta +
             ", producerIdsDelta=" + producerIdsDelta +
+            ", aclsDelta=" + aclsDelta +
             ')';
     }
 }

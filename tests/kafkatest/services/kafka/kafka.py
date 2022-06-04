@@ -158,7 +158,8 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
     METADATA_SNAPSHOT_SEARCH_STR = "%s/__cluster_metadata-0/*.checkpoint" % METADATA_LOG_DIR
     METADATA_FIRST_LOG = "%s/__cluster_metadata-0/00000000000000000000.log" % METADATA_LOG_DIR
     # Kafka Authorizer
-    ACL_AUTHORIZER = "kafka.security.authorizer.AclAuthorizer"
+    ZK_ACL_AUTHORIZER = "kafka.security.authorizer.AclAuthorizer"
+    KRAFT_ACL_AUTHORIZER = "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
     HEAP_DUMP_FILE = os.path.join(PERSISTENT_ROOT, "kafka_heap_dump.bin")
     INTERBROKER_LISTENER_NAME = 'INTERNAL'
     JAAS_CONF_PROPERTY = "java.security.auth.login.config=/mnt/security/jaas.conf"
@@ -181,6 +182,9 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
             "collect_default": False},
         "kafka_data_2": {
             "path": DATA_LOG_DIR_2,
+            "collect_default": False},
+        "kafka_cluster_metadata": {
+            "path": METADATA_LOG_DIR,
             "collect_default": False},
         "kafka_heap_dump_file": {
             "path": HEAP_DUMP_FILE,
@@ -677,7 +681,7 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
         advertised_listeners = []
         protocol_map = []
 
-        controller_listener_names = self.controller_listener_name_list()
+        controller_listener_names = self.controller_listener_name_list(node)
 
         for port in self.port_mappings.values():
             if port.open:
@@ -758,12 +762,17 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
                 KafkaService.STDOUT_STDERR_CAPTURE)
         return cmd
 
-    def controller_listener_name_list(self):
+    def controller_listener_name_list(self, node):
         if self.quorum_info.using_zk:
             return []
         broker_to_controller_listener_name = self.controller_listener_name(self.controller_quorum.controller_security_protocol)
-        return [broker_to_controller_listener_name] if (self.controller_quorum.intercontroller_security_protocol == self.controller_quorum.controller_security_protocol) \
-            else [broker_to_controller_listener_name, self.controller_listener_name(self.controller_quorum.intercontroller_security_protocol)]
+        # Brokers always use the first controller listener, so include a second, inter-controller listener if and only if:
+        # 1) the node is a controller node
+        # 2) the inter-controller listener name differs from the broker-to-controller listener name
+        return [broker_to_controller_listener_name, self.controller_listener_name(self.controller_quorum.intercontroller_security_protocol)] \
+            if (quorum.NodeQuorumInfo(self.quorum_info, node).has_controller_role and
+                self.controller_quorum.intercontroller_security_protocol != self.controller_quorum.controller_security_protocol) \
+            else [broker_to_controller_listener_name]
 
     def start_node(self, node, timeout_sec=60):
         if node not in self.nodes_to_start:
@@ -772,7 +781,7 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
 
         self.node_quorum_info = quorum.NodeQuorumInfo(self.quorum_info, node)
         if self.quorum_info.has_controllers:
-            for controller_listener in self.controller_listener_name_list():
+            for controller_listener in self.controller_listener_name_list(node):
                 if self.node_quorum_info.has_controller_role:
                     self.open_port(controller_listener)
                 else: # co-located case where node doesn't have a controller
@@ -793,7 +802,7 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
                                                        KafkaService.SECURITY_PROTOCOLS.index(security_protocol_to_use))
                                                       for node in self.controller_quorum.nodes[:self.controller_quorum.num_nodes_controller_role]])
             # define controller.listener.names
-            self.controller_listener_names = ','.join(self.controller_listener_name_list())
+            self.controller_listener_names = ','.join(self.controller_listener_name_list(node))
             # define sasl.mechanism.controller.protocol to match remote quorum if one exists
             if self.remote_controller_quorum:
                 self.controller_sasl_mechanism = self.remote_controller_quorum.controller_sasl_mechanism
