@@ -100,7 +100,7 @@ $ bin/kafka-server-start.sh config/server.properties</code></pre>
         </p>
 
         <pre class="line-numbers"><code class="language-bash">$ bin/kafka-topics.sh --describe --topic quickstart-events --bootstrap-server localhost:9092
-Topic:quickstart-events  PartitionCount:1    ReplicationFactor:1 Configs:
+Topic: quickstart-events        TopicId: NPmZHyhbR9y00wMglMH2sg PartitionCount: 1       ReplicationFactor: 1	Configs:
     Topic: quickstart-events Partition: 0    Leader: 0   Replicas: 0 Isr: 0</code></pre>
     </div>
 
@@ -175,7 +175,7 @@ This is my second event</code></pre>
         <p>
             First, make sure to add <code class="language-bash">connect-file-{{fullDotVersion}}.jar</code> to the <code>plugin.path</code> property in the Connect worker's configuration.
             For the purpose of this quickstart we'll use a relative path and consider the connectors' package as an uber jar, which works when the quickstart commands are run from the installation directory.
-            However, it's worth noting that for production deployments using absolute paths is always preferable. See <a href="#connectconfigs_plugin.path">plugin.path</a> for a detailed description of how to set this config.
+            However, it's worth noting that for production deployments using absolute paths is always preferable. See <a href="/documentation/#connectconfigs_plugin.path">plugin.path</a> for a detailed description of how to set this config.
         </p>
 
         <p>
@@ -183,7 +183,7 @@ This is my second event</code></pre>
         </p>
 
         <pre class="brush: bash;">
-&gt; echo "plugin.path=lib/connect-file-{{fullDotVersion}}.jar"</pre>
+&gt; echo "plugin.path=libs/connect-file-{{fullDotVersion}}.jar"</pre>
 
         <p>
             Then, start by creating some seed data to test with:
@@ -278,7 +278,7 @@ wordCounts.toStream().to("output-topic", Produced.with(Serdes.String(), Serdes.L
 
         <p>
             The <a href="/documentation/streams/quickstart">Kafka Streams demo</a>
-            and the <a href="/documentation/streams/tutorial">app development tutorial</a>
+            and the <a href="/{{version}}/documentation/streams/tutorial">app development tutorial</a>
             demonstrate how to code and run such a streaming application from start to finish.
         </p>
 

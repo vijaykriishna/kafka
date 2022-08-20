@@ -14,29 +14,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.kafka.connect.util;
-
-import org.junit.After;
-import org.junit.Before;
+package org.apache.kafka.connect.runtime.isolation;
 
 /**
- * Base class for tests that use threads. It sets up uncaught exception handlers for all known
- * thread classes and checks for errors at the end of the test so that failures in background
- * threads will cause the test to fail.
+ * Helper for having {@code Plugins} use a given classloader within a try-with-resources statement.
+ * See {@link Plugins#withClassLoader(ClassLoader)}.
  */
-public class ThreadedTest {
+public class LoaderSwap implements AutoCloseable {
 
-    protected TestBackgroundThreadExceptionHandler backgroundThreadExceptionHandler;
+    private final ClassLoader savedLoader;
 
-    @Before
-    public void setup() {
-        backgroundThreadExceptionHandler = new TestBackgroundThreadExceptionHandler();
-        ShutdownableThread.funcaughtExceptionHandler = backgroundThreadExceptionHandler;
+    public LoaderSwap(ClassLoader savedLoader) {
+        this.savedLoader = savedLoader;
     }
 
-    @After
-    public void teardown() {
-        backgroundThreadExceptionHandler.verifyNoExceptions();
-        ShutdownableThread.funcaughtExceptionHandler = null;
+    @Override
+    public void close() {
+        Plugins.compareAndSwapLoaders(savedLoader);
     }
+
 }
