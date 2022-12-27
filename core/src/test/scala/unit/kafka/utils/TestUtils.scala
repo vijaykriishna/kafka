@@ -70,6 +70,7 @@ import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.controller.QuorumController
 import org.apache.kafka.server.authorizer.{AuthorizableRequestContext, Authorizer => JAuthorizer}
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.server.log.internals.LogDirFailureChannel
 import org.apache.kafka.server.metrics.KafkaYammerMetrics
 import org.apache.kafka.test.{TestSslUtils, TestUtils => JTestUtils}
 import org.apache.zookeeper.KeeperException.SessionExpiredException
@@ -150,6 +151,11 @@ object TestUtils extends Logging {
   def tempFile(): File = JTestUtils.tempFile()
 
   /**
+   * Create a temporary file with particular suffix and prefix
+   */
+  def tempFile(prefix: String, suffix: String): File = JTestUtils.tempFile(prefix, suffix)
+
+  /**
    * Create a temporary file and return an open file channel for this file
    */
   def tempChannel(): FileChannel =
@@ -174,7 +180,12 @@ object TestUtils extends Logging {
   }
 
   def createServer(config: KafkaConfig, time: Time, threadNamePrefix: Option[String], startup: Boolean): KafkaServer = {
-    val server = new KafkaServer(config, time, threadNamePrefix, enableForwarding = false)
+    createServer(config, time, threadNamePrefix, startup, enableZkApiForwarding = false)
+  }
+
+  def createServer(config: KafkaConfig, time: Time, threadNamePrefix: Option[String],
+                   startup: Boolean, enableZkApiForwarding: Boolean) = {
+    val server = new KafkaServer(config, time, threadNamePrefix, enableForwarding = enableZkApiForwarding)
     if (startup) server.startup()
     server
   }
@@ -209,14 +220,14 @@ object TestUtils extends Logging {
     enableToken: Boolean = false,
     numPartitions: Int = 1,
     defaultReplicationFactor: Short = 1,
-    startingIdNumber: Int = 0
-  ): Seq[Properties] = {
+    startingIdNumber: Int = 0,
+    enableFetchFromFollower: Boolean = false): Seq[Properties] = {
     val endingIdNumber = startingIdNumber + numConfigs - 1
     (startingIdNumber to endingIdNumber).map { node =>
       createBrokerConfig(node, zkConnect, enableControlledShutdown, enableDeleteTopic, RandomPort,
         interBrokerSecurityProtocol, trustStoreFile, saslProperties, enablePlaintext = enablePlaintext, enableSsl = enableSsl,
         enableSaslPlaintext = enableSaslPlaintext, enableSaslSsl = enableSaslSsl, rack = rackInfo.get(node), logDirCount = logDirCount, enableToken = enableToken,
-        numPartitions = numPartitions, defaultReplicationFactor = defaultReplicationFactor)
+        numPartitions = numPartitions, defaultReplicationFactor = defaultReplicationFactor, enableFetchFromFollower = enableFetchFromFollower)
     }
   }
 
@@ -275,7 +286,8 @@ object TestUtils extends Logging {
                          logDirCount: Int = 1,
                          enableToken: Boolean = false,
                          numPartitions: Int = 1,
-                         defaultReplicationFactor: Short = 1): Properties = {
+                         defaultReplicationFactor: Short = 1,
+                         enableFetchFromFollower: Boolean = false): Properties = {
     def shouldEnable(protocol: SecurityProtocol) = interBrokerSecurityProtocol.fold(false)(_ == protocol)
 
     val protocolAndPorts = ArrayBuffer[(SecurityProtocol, Int)]()
@@ -356,6 +368,11 @@ object TestUtils extends Logging {
 
     props.put(KafkaConfig.NumPartitionsProp, numPartitions.toString)
     props.put(KafkaConfig.DefaultReplicationFactorProp, defaultReplicationFactor.toString)
+
+    if (enableFetchFromFollower) {
+      props.put(KafkaConfig.RackProp, nodeId.toString)
+      props.put(KafkaConfig.ReplicaSelectorClassProp, "org.apache.kafka.common.replica.RackAwareReplicaSelector")
+    }
 
     props
   }
@@ -1345,7 +1362,7 @@ object TestUtils extends Logging {
                    flushStartOffsetCheckpointMs = 10000L,
                    retentionCheckMs = 1000L,
                    maxTransactionTimeoutMs = 5 * 60 * 1000,
-                   maxPidExpirationMs = 60 * 60 * 1000,
+                   producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs),
                    producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs,
                    scheduler = time.scheduler,
                    time = time,
@@ -1884,7 +1901,7 @@ object TestUtils extends Logging {
   def alterClientQuotas(adminClient: Admin, request: Map[ClientQuotaEntity, Map[String, Option[Double]]]): AlterClientQuotasResult = {
     val entries = request.map { case (entity, alter) =>
       val ops = alter.map { case (key, value) =>
-        new ClientQuotaAlteration.Op(key, value.map(Double.box).getOrElse(null))
+        new ClientQuotaAlteration.Op(key, value.map(Double.box).orNull)
       }.asJavaCollection
       new ClientQuotaAlteration(entity, ops)
     }.asJavaCollection
@@ -2029,7 +2046,10 @@ object TestUtils extends Logging {
       fail("Expected illegal configuration but instead it was legal")
     } catch {
       case caught @ (_: ConfigException | _: IllegalArgumentException) =>
-        assertTrue(caught.getMessage.contains(expectedExceptionContainsText))
+        assertTrue(
+          caught.getMessage.contains(expectedExceptionContainsText),
+          s""""${caught.getMessage}" doesn't contain "$expectedExceptionContainsText""""
+        )
     }
   }
 

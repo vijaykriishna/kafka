@@ -16,7 +16,6 @@
  */
 package org.apache.kafka.clients.consumer.internals;
 
-import java.time.Duration;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import org.apache.kafka.clients.GroupRebalanceConfig;
@@ -118,6 +117,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     private AtomicBoolean asyncCommitFenced;
     private ConsumerGroupMetadata groupMetadata;
     private final boolean throwOnFetchStableOffsetsUnsupported;
+    private final Optional<String> rackId;
 
     // hold onto request&future for committed offset requests to enable async calls.
     private PendingCommittedOffsetRequest pendingCommittedOffsetRequest = null;
@@ -163,7 +163,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                                boolean autoCommitEnabled,
                                int autoCommitIntervalMs,
                                ConsumerInterceptors<?, ?> interceptors,
-                               boolean throwOnFetchStableOffsetsUnsupported) {
+                               boolean throwOnFetchStableOffsetsUnsupported,
+                               String rackId) {
         super(rebalanceConfig,
               logContext,
               client,
@@ -187,6 +188,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         this.groupMetadata = new ConsumerGroupMetadata(rebalanceConfig.groupId,
             JoinGroupRequest.UNKNOWN_GENERATION_ID, JoinGroupRequest.UNKNOWN_MEMBER_ID, rebalanceConfig.groupInstanceId);
         this.throwOnFetchStableOffsetsUnsupported = throwOnFetchStableOffsetsUnsupported;
+        this.rackId = rackId == null || rackId.isEmpty() ? Optional.empty() : Optional.of(rackId);
 
         if (autoCommitEnabled)
             this.nextAutoCommitTimer = time.timer(autoCommitIntervalMs);
@@ -245,7 +247,9 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         for (ConsumerPartitionAssignor assignor : assignors) {
             Subscription subscription = new Subscription(topics,
                                                          assignor.subscriptionUserData(joinedSubscription),
-                                                         subscriptions.assignedPartitionsList());
+                                                         subscriptions.assignedPartitionsList(),
+                                                         generation().generationId,
+                                                         rackId);
             ByteBuffer metadata = ConsumerProtocol.serializeSubscription(subscription);
 
             protocolSet.add(new JoinGroupRequestData.JoinGroupRequestProtocol()
@@ -489,8 +493,12 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         }
     }
 
-    private boolean coordinatorUnknownAndUnready(Timer timer) {
+    private boolean coordinatorUnknownAndUnreadySync(Timer timer) {
         return coordinatorUnknown() && !ensureCoordinatorReady(timer);
+    }
+
+    private boolean coordinatorUnknownAndUnreadyAsync() {
+        return coordinatorUnknown() && !ensureCoordinatorReadyAsync();
     }
 
     /**
@@ -518,7 +526,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             // Always update the heartbeat last poll time so that the heartbeat thread does not leave the
             // group proactively due to application inactivity even if (say) the coordinator cannot be found.
             pollHeartbeat(timer.currentTimeMs());
-            if (coordinatorUnknownAndUnready(timer)) {
+            if (coordinatorUnknownAndUnreadySync(timer)) {
                 return false;
             }
 
@@ -759,6 +767,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         // async commit offsets prior to rebalance if auto-commit enabled
         // and there is no in-flight offset commit request
         if (autoCommitEnabled && autoCommitOffsetRequestFuture == null) {
+            maybeMarkPartitionsPendingRevocation();
             autoCommitOffsetRequestFuture = maybeAutoCommitOffsetsAsync();
         }
 
@@ -857,6 +866,22 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             throw new KafkaException("User rebalance callback throws an error", exception);
         }
         return true;
+    }
+
+    private void maybeMarkPartitionsPendingRevocation() {
+        if (protocol != RebalanceProtocol.EAGER) {
+            return;
+        }
+
+        // When asynchronously committing offsets prior to the revocation of a set of partitions, there will be a
+        // window of time between when the offset commit is sent and when it returns and revocation completes. It is
+        // possible for pending fetches for these partitions to return during this time, which means the application's
+        // position may get ahead of the committed position prior to revocation. This can cause duplicate consumption.
+        // To prevent this, we mark the partitions as "pending revocation," which stops the Fetcher from sending new
+        // fetches or returning data from previous fetches to the user.
+        Set<TopicPartition> partitions = subscriptions.assignedPartitions();
+        log.debug("Marking assigned partitions pending for revocation: {}", partitions);
+        subscriptions.markPendingRevocation(partitions);
     }
 
     @Override
@@ -1052,7 +1077,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         if (offsets.isEmpty()) {
             // No need to check coordinator if offsets is empty since commit of empty offsets is completed locally.
             future = doCommitOffsetsAsync(offsets, callback);
-        } else if (!coordinatorUnknownAndUnready(time.timer(Duration.ZERO))) {
+        } else if (!coordinatorUnknownAndUnreadyAsync()) {
             // we need to make sure coordinator is ready before committing, since
             // this is for async committing we do not try to block, but just try once to
             // clear the previous discover-coordinator future, resend, or get responses;
@@ -1141,7 +1166,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             return true;
 
         do {
-            if (coordinatorUnknownAndUnready(timer)) {
+            if (coordinatorUnknownAndUnreadySync(timer)) {
                 return false;
             }
 
@@ -1272,8 +1297,10 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         }
 
         final Generation generation;
+        final String groupInstanceId;
         if (subscriptions.hasAutoAssignedPartitions()) {
             generation = generationIfStable();
+            groupInstanceId = rebalanceConfig.groupInstanceId.orElse(null);
             // if the generation is null, we are not part of an active group (and we expect to be).
             // the only thing we can do is fail the commit and let the user rejoin the group in poll().
             if (generation == null) {
@@ -1293,6 +1320,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             }
         } else {
             generation = Generation.NO_GENERATION;
+            groupInstanceId = null;
         }
 
         OffsetCommitRequest.Builder builder = new OffsetCommitRequest.Builder(
@@ -1300,7 +1328,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                         .setGroupId(this.rebalanceConfig.groupId)
                         .setGenerationId(generation.generationId)
                         .setMemberId(generation.memberId)
-                        .setGroupInstanceId(rebalanceConfig.groupInstanceId.orElse(null))
+                        .setGroupInstanceId(groupInstanceId)
                         .setTopics(new ArrayList<>(requestTopicDataMap.values()))
         );
 

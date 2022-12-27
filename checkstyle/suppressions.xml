@@ -49,6 +49,8 @@
               files="(Fetcher|Sender|SenderTest|ConsumerCoordinator|KafkaConsumer|KafkaProducer|Utils|TransactionManager|TransactionManagerTest|KafkaAdminClient|NetworkClient|Admin|KafkaRaftClient|KafkaRaftClientTest|RaftClientTestContext).java"/>
     <suppress checks="ClassFanOutComplexity"
               files="(SaslServerAuthenticator|SaslAuthenticatorTest).java"/>
+    <suppress checks="NPath"
+              files="SaslServerAuthenticator.java"/>
     <suppress checks="ClassFanOutComplexity"
               files="Errors.java"/>
     <suppress checks="ClassFanOutComplexity"
@@ -64,7 +66,7 @@
     <suppress checks="ParameterNumber"
               files="(NetworkClient|FieldSpec|KafkaRaftClient).java"/>
     <suppress checks="ParameterNumber"
-              files="KafkaConsumer.java"/>
+              files="(KafkaConsumer|ConsumerCoordinator).java"/>
     <suppress checks="ParameterNumber"
               files="Fetcher.java"/>
     <suppress checks="ParameterNumber"
@@ -132,7 +134,7 @@
     <suppress checks="ClassFanOutComplexity"
               files="Worker(|Test).java"/>
     <suppress checks="MethodLength"
-              files="(DistributedHerder|KafkaConfigBackingStore|Values|IncrementalCooperativeAssignor).java"/>
+              files="(DistributedHerder|DistributedConfig|KafkaConfigBackingStore|Values|IncrementalCooperativeAssignor).java"/>
     <suppress checks="ParameterNumber"
               files="Worker(SinkTask|SourceTask|Coordinator).java"/>
     <suppress checks="ParameterNumber"
@@ -170,6 +172,10 @@
     <suppress checks="JavaNCSS"
               files="DistributedHerderTest.java"/>
 
+    <!-- Raft -->
+    <suppress checks="NPathComplexity"
+              files="RecordsIterator.java"/>
+
     <!-- Streams -->
     <suppress checks="ClassFanOutComplexity"
               files="(KafkaStreams|KStreamImpl|KTableImpl|InternalTopologyBuilder|StreamsPartitionAssignor|StreamThread|IQv2StoreIntegrationTest|KStreamImplTest).java"/>
@@ -190,7 +196,7 @@
               files="StreamsMetricsImpl.java"/>
 
     <suppress checks="NPathComplexity"
-              files="(KafkaStreams|StreamsPartitionAssignor|StreamThread|TaskManager|GlobalStateManagerImpl|KStreamImplJoin).java"/>
+              files="(KafkaStreams|StreamsPartitionAssignor|StreamThread|TaskManager|GlobalStateManagerImpl|KStreamImplJoin|TopologyConfig).java"/>
 
     <suppress checks="(FinalLocalVariable|UnnecessaryParentheses|BooleanExpressionComplexity|CyclomaticComplexity|WhitespaceAfter|LocalVariableName)"
               files="Murmur3.java"/>
@@ -312,9 +318,13 @@
     <suppress checks="AvoidStarImport"
               files="MetadataVersionTest.java"/>
 
-    <!-- Storage -->
-    <suppress checks="(CyclomaticComplexity|ParameterNumber)"
-              files="(RemoteLogManagerConfig).java"/>
+    <!-- storage -->
+    <suppress checks="CyclomaticComplexity"
+              files="(LogValidator|RemoteLogManagerConfig).java"/>
+    <suppress checks="NPathComplexity"
+              files="LogValidator.java"/>
+    <suppress checks="ParameterNumber"
+              files="RemoteLogManagerConfig.java"/>
 
     <!-- benchmarks -->
     <suppress checks="(ClassDataAbstractionCoupling|ClassFanOutComplexity)"

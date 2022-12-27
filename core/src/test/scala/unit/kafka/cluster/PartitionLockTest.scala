@@ -35,6 +35,7 @@ import org.apache.kafka.common.requests.FetchRequest
 import org.apache.kafka.common.utils.Utils
 import org.apache.kafka.common.{TopicPartition, Uuid}
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.server.log.internals.{AppendOrigin, LogDirFailureChannel}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.mockito.ArgumentMatchers
@@ -294,12 +295,12 @@ class PartitionLockTest extends Logging {
         val segments = new LogSegments(log.topicPartition)
         val leaderEpochCache = UnifiedLog.maybeCreateLeaderEpochCache(log.dir, log.topicPartition, logDirFailureChannel, log.config.recordVersion, "")
         val maxTransactionTimeout = 5 * 60 * 1000
-        val maxProducerIdExpirationMs = 60 * 60 * 1000
+        val producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs)
         val producerStateManager = new ProducerStateManager(
           log.topicPartition,
           log.dir,
           maxTransactionTimeout,
-          maxProducerIdExpirationMs,
+          producerStateManagerConfig,
           mockTime
         )
         val offsets = new LogLoader(
@@ -369,7 +370,7 @@ class PartitionLockTest extends Logging {
     (0 until numRecords).foreach { _ =>
       val batch = TestUtils.records(records = List(new SimpleRecord("k1".getBytes, "v1".getBytes),
         new SimpleRecord("k2".getBytes, "v2".getBytes)))
-      partition.appendRecordsToLeader(batch, origin = AppendOrigin.Client, requiredAcks = 0, requestLocal)
+      partition.appendRecordsToLeader(batch, origin = AppendOrigin.CLIENT, requiredAcks = 0, requestLocal)
     }
   }
 

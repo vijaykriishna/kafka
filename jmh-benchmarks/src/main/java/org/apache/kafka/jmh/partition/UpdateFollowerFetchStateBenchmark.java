@@ -27,7 +27,6 @@ import kafka.log.LogConfig;
 import kafka.log.LogManager;
 import kafka.server.AlterPartitionManager;
 import kafka.server.BrokerTopicStats;
-import kafka.server.LogDirFailureChannel;
 import kafka.server.LogOffsetMetadata;
 import kafka.server.MetadataCache;
 import kafka.server.builders.LogManagerBuilder;
@@ -39,6 +38,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.LeaderAndIsrRequestData.LeaderAndIsrPartitionState;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.log.internals.LogDirFailureChannel;
 import org.mockito.Mockito;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -98,7 +98,7 @@ public class UpdateFollowerFetchStateBenchmark {
             setFlushRecoveryOffsetCheckpointMs(10000L).
             setFlushStartOffsetCheckpointMs(10000L).
             setRetentionCheckMs(1000L).
-            setMaxPidExpirationMs(60000).
+            setMaxProducerIdExpirationMs(60000).
             setInterBrokerProtocolVersion(MetadataVersion.latest()).
             setScheduler(scheduler).
             setBrokerTopicStats(brokerTopicStats).

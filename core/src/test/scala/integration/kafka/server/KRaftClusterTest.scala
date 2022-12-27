@@ -21,7 +21,7 @@ import kafka.network.SocketServer
 import kafka.server.IntegrationTestUtils.connectAndReceive
 import kafka.testkit.{BrokerNode, KafkaClusterTestKit, TestKitNodes}
 import kafka.utils.TestUtils
-import org.apache.kafka.clients.admin.{Admin, AdminClientConfig, AlterConfigOp, Config, ConfigEntry, DescribeMetadataQuorumOptions, NewPartitionReassignment, NewTopic}
+import org.apache.kafka.clients.admin.{Admin, AdminClientConfig, AlterConfigOp, Config, ConfigEntry, DescribeMetadataQuorumOptions, FeatureUpdate, NewPartitionReassignment, NewTopic, UpdateFeaturesOptions}
 import org.apache.kafka.common.{TopicPartition, TopicPartitionInfo}
 import org.apache.kafka.common.message.DescribeClusterRequestData
 import org.apache.kafka.common.network.ListenerName
@@ -39,8 +39,11 @@ import org.apache.kafka.common.config.ConfigResource.Type
 import org.apache.kafka.common.protocol.Errors._
 import org.apache.kafka.image.ClusterImage
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
 import org.slf4j.LoggerFactory
 
+import java.io.File
+import java.nio.file.{FileSystems, Path}
 import scala.annotation.nowarn
 import scala.collection.mutable
 import scala.concurrent.ExecutionException
@@ -62,6 +65,23 @@ class KRaftClusterTest {
     try {
       cluster.format()
       cluster.startup()
+    } finally {
+      cluster.close()
+    }
+  }
+
+  @Test
+  def testCreateClusterAndRestartNode(): Unit = {
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder().
+        setNumBrokerNodes(1).
+        setNumControllerNodes(1).build()).build()
+    try {
+      cluster.format()
+      cluster.startup()
+      val broker = cluster.brokers().values().iterator().next()
+      broker.shutdown()
+      broker.startup()
     } finally {
       cluster.close()
     }
@@ -781,6 +801,7 @@ class KRaftClusterTest {
       cluster.close()
     }
   }
+
   def createAdminClient(cluster: KafkaClusterTestKit): Admin = {
     var props: Properties = null
     props = cluster.clientProperties()
@@ -810,20 +831,33 @@ class KRaftClusterTest {
         assertTrue(cluster.controllers.asScala.keySet.contains(quorumInfo.leaderId),
           s"Leader ID ${quorumInfo.leaderId} was not a controller ID.")
 
-        quorumInfo.voters.forEach { voter =>
-          assertTrue(0 < voter.logEndOffset,
-            s"logEndOffset for voter with ID ${voter.replicaId} was ${voter.logEndOffset}")
-          assertNotEquals(OptionalLong.empty(), voter.lastFetchTimestamp)
-          assertNotEquals(OptionalLong.empty(), voter.lastCaughtUpTimestamp)
-        }
+        val (voters, voterResponseValid) =
+          TestUtils.computeUntilTrue(
+            admin.describeMetadataQuorum(new DescribeMetadataQuorumOptions)
+              .quorumInfo().get().voters()
+          ) { voters => voters.stream
+            .allMatch(voter => (voter.logEndOffset > 0
+              && voter.lastFetchTimestamp() != OptionalLong.empty()
+              && voter.lastCaughtUpTimestamp() != OptionalLong.empty()))
+          }
 
-        assertEquals(cluster.brokers.asScala.keySet, quorumInfo.observers.asScala.map(_.replicaId).toSet)
-        quorumInfo.observers.forEach { observer =>
-          assertTrue(0 < observer.logEndOffset,
-            s"logEndOffset for observer with ID ${observer.replicaId} was ${observer.logEndOffset}")
-          assertNotEquals(OptionalLong.empty(), observer.lastFetchTimestamp)
-          assertNotEquals(OptionalLong.empty(), observer.lastCaughtUpTimestamp)
-        }
+        assertTrue(voterResponseValid, s"At least one voter did not return the expected state within timeout." +
+          s"The responses gathered for all the voters: ${voters.toString}")
+
+        val (observers, observerResponseValid) =
+          TestUtils.computeUntilTrue(
+            admin.describeMetadataQuorum(new DescribeMetadataQuorumOptions)
+              .quorumInfo().get().observers()
+          ) { observers =>
+            (
+              cluster.brokers.asScala.keySet == observers.asScala.map(_.replicaId).toSet
+                && observers.stream.allMatch(observer => (observer.logEndOffset > 0
+                && observer.lastFetchTimestamp() != OptionalLong.empty()
+                && observer.lastCaughtUpTimestamp() != OptionalLong.empty())))
+          }
+
+        assertTrue(observerResponseValid, s"At least one observer did not return the expected state within timeout." +
+            s"The responses gathered for all the observers: ${observers.toString}")
       } finally {
         admin.close()
       }
@@ -832,4 +866,87 @@ class KRaftClusterTest {
     }
   }
 
+
+  @Test
+  def testUpdateMetadataVersion(): Unit = {
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder().
+        setBootstrapMetadataVersion(MetadataVersion.MINIMUM_BOOTSTRAP_VERSION).
+        setNumBrokerNodes(4).
+        setNumControllerNodes(3).build()).build()
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+      val admin = Admin.create(cluster.clientProperties())
+      try {
+        admin.updateFeatures(
+          Map(MetadataVersion.FEATURE_NAME ->
+            new FeatureUpdate(MetadataVersion.latest().featureLevel(), FeatureUpdate.UpgradeType.UPGRADE)).asJava, new UpdateFeaturesOptions
+        )
+      } finally {
+        admin.close()
+      }
+      TestUtils.waitUntilTrue(() => cluster.brokers().get(1).metadataCache.currentImage().features().metadataVersion().equals(MetadataVersion.latest()),
+        "Timed out waiting for metadata version update.")
+    } finally {
+      cluster.close()
+    }
+  }
+
+  @Test
+  def testRemoteLogManagerInstantiation(): Unit = {
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder().
+        setNumBrokerNodes(1).
+        setNumControllerNodes(1).build())
+      .setConfigProp(RemoteLogManagerConfig.REMOTE_LOG_STORAGE_SYSTEM_ENABLE_PROP, true.toString)
+      .setConfigProp(RemoteLogManagerConfig.REMOTE_LOG_METADATA_MANAGER_CLASS_NAME_PROP,
+        "org.apache.kafka.server.log.remote.storage.NoOpRemoteLogMetadataManager")
+      .setConfigProp(RemoteLogManagerConfig.REMOTE_STORAGE_MANAGER_CLASS_NAME_PROP,
+        "org.apache.kafka.server.log.remote.storage.NoOpRemoteStorageManager")
+      .build()
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.brokers().forEach((_, server) => {
+        server.remoteLogManager match {
+          case Some(_) =>
+          case None => fail("RemoteLogManager should be initialized")
+        }
+      })
+    } finally {
+      cluster.close()
+    }
+  }
+
+  @Test
+  def testSnapshotCount(): Unit = {
+    val cluster = new KafkaClusterTestKit.Builder(
+      new TestKitNodes.Builder().
+        setNumBrokerNodes(0).
+        setNumControllerNodes(1).build())
+      .setConfigProp("metadata.log.max.snapshot.interval.ms", "500")
+      .setConfigProp("metadata.max.idle.interval.ms", "50") // Set this low to generate metadata
+      .build()
+
+    try {
+      cluster.format()
+      cluster.startup()
+      def snapshotCounter(path: Path): Long = {
+       path.toFile.listFiles((_: File, name: String) => {
+          name.toLowerCase.endsWith("checkpoint")
+        }).length
+      }
+
+      val metaLog = FileSystems.getDefault.getPath(cluster.controllers().get(3000).config.metadataLogDir, "__cluster_metadata-0")
+      TestUtils.waitUntilTrue(() => { snapshotCounter(metaLog) > 0 }, "Failed to see at least one snapshot")
+      Thread.sleep(500 * 10) // Sleep for 10 snapshot intervals
+      val countAfterTenIntervals = snapshotCounter(metaLog)
+      assertTrue(countAfterTenIntervals > 1, s"Expected to see at least one more snapshot, saw $countAfterTenIntervals")
+      assertTrue(countAfterTenIntervals < 20, s"Did not expect to see more than twice as many snapshots as snapshot intervals, saw $countAfterTenIntervals")
+    } finally {
+      cluster.close()
+    }
+  }
 }

@@ -25,7 +25,7 @@ import kafka.server.AlterPartitionManager;
 import kafka.server.BrokerFeatures;
 import kafka.server.BrokerTopicStats;
 import kafka.server.KafkaConfig;
-import kafka.server.LogDirFailureChannel;
+import kafka.server.MetadataCache;
 import kafka.server.QuotaFactory;
 import kafka.server.ReplicaManager;
 import kafka.server.builders.LogManagerBuilder;
@@ -33,7 +33,6 @@ import kafka.server.builders.ReplicaManagerBuilder;
 import kafka.server.checkpoints.OffsetCheckpoints;
 import kafka.server.metadata.ConfigRepository;
 import kafka.server.metadata.MockConfigRepository;
-import kafka.server.metadata.ZkMetadataCache;
 import kafka.utils.KafkaScheduler;
 import kafka.utils.Scheduler;
 import kafka.utils.TestUtils;
@@ -45,6 +44,7 @@ import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.log.internals.LogDirFailureChannel;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -110,7 +110,7 @@ public class PartitionCreationBench {
         this.brokerProperties = KafkaConfig.fromProps(TestUtils.createBrokerConfig(
                 0, TestUtils.MockZkConnect(), true, true, 9092, Option.empty(), Option.empty(),
                 Option.empty(), true, false, 0, false, 0, false, 0, Option.empty(), 1, true, 1,
-                (short) 1));
+                (short) 1, false));
         this.metrics = new Metrics();
         this.time = Time.SYSTEM;
         this.failureChannel = new LogDirFailureChannel(brokerProperties.logDirs().size());
@@ -134,7 +134,7 @@ public class PartitionCreationBench {
             setFlushRecoveryOffsetCheckpointMs(10000L).
             setFlushStartOffsetCheckpointMs(10000L).
             setRetentionCheckMs(1000L).
-            setMaxPidExpirationMs(60000).
+            setMaxProducerIdExpirationMs(60000).
             setInterBrokerProtocolVersion(MetadataVersion.latest()).
             setScheduler(scheduler).
             setBrokerTopicStats(brokerTopicStats).
@@ -160,7 +160,9 @@ public class PartitionCreationBench {
             setLogManager(logManager).
             setQuotaManagers(quotaManagers).
             setBrokerTopicStats(brokerTopicStats).
-            setMetadataCache(new ZkMetadataCache(this.brokerProperties.brokerId(), this.brokerProperties.interBrokerProtocolVersion(), BrokerFeatures.createEmpty())).
+            setMetadataCache(MetadataCache.zkMetadataCache(this.brokerProperties.brokerId(),
+                this.brokerProperties.interBrokerProtocolVersion(), BrokerFeatures.createEmpty(),
+                null)).
             setLogDirFailureChannel(failureChannel).
             setAlterPartitionManager(alterPartitionManager).
             build();

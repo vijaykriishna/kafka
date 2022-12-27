@@ -24,9 +24,9 @@ import java.util.concurrent.locks.Lock
 import com.yammer.metrics.core.Meter
 import kafka.api._
 import kafka.cluster.{BrokerEndPoint, Partition}
-import kafka.common.RecordValidationException
 import kafka.controller.{KafkaController, StateChangeLogger}
 import kafka.log._
+import kafka.log.remote.RemoteLogManager
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.HostedPartition.Online
 import kafka.server.QuotaFactory.QuotaManagers
@@ -61,8 +61,10 @@ import org.apache.kafka.common.utils.Time
 import org.apache.kafka.image.{LocalReplicaChanges, MetadataImage, TopicsDelta}
 import org.apache.kafka.metadata.LeaderConstants.NO_LEADER
 import org.apache.kafka.server.common.MetadataVersion._
+import org.apache.kafka.server.log.internals.{AppendOrigin, LogDirFailureChannel, RecordValidationException}
 
 import java.nio.file.{Files, Paths}
+import java.util
 import scala.jdk.CollectionConverters._
 import scala.collection.{Map, Seq, Set, mutable}
 import scala.compat.java8.OptionConverters._
@@ -189,6 +191,7 @@ class ReplicaManager(val config: KafkaConfig,
                      time: Time,
                      scheduler: Scheduler,
                      val logManager: LogManager,
+                     val remoteLogManager: Option[RemoteLogManager] = None,
                      quotaManagers: QuotaManagers,
                      val metadataCache: MetadataCache,
                      logDirFailureChannel: LogDirFailureChannel,
@@ -329,6 +332,15 @@ class ReplicaManager(val config: KafkaConfig,
     val topicPartitionOperationKey = TopicPartitionOperationKey(topicPartition)
     delayedProducePurgatory.checkAndComplete(topicPartitionOperationKey)
     delayedFetchPurgatory.checkAndComplete(topicPartitionOperationKey)
+  }
+
+  /**
+   * Complete any local follower fetches that have been unblocked since new data is available
+   * from the leader for one or more partitions. Should only be called by ReplicaFetcherThread
+   * after successfully replicating from the leader.
+   */
+  private[server] def completeDelayedFetchRequests(topicPartitions: Seq[TopicPartition]): Unit = {
+    topicPartitions.foreach(tp => delayedFetchPurgatory.checkAndComplete(TopicPartitionOperationKey(tp)))
   }
 
   def stopReplicas(correlationId: Int,
@@ -972,7 +984,7 @@ class ReplicaManager(val config: KafkaConfig,
             val logStartOffset = processFailedRecord(topicPartition, rve.invalidException)
             val recordErrors = rve.recordErrors
             (topicPartition, LogAppendResult(LogAppendInfo.unknownLogAppendInfoWithAdditionalInfo(
-              logStartOffset, recordErrors, rve.invalidException.getMessage), Some(rve.invalidException)))
+              logStartOffset, recordErrors.asScala, rve.invalidException.getMessage), Some(rve.invalidException)))
           case t: Throwable =>
             val logStartOffset = processFailedRecord(topicPartition, t)
             (topicPartition, LogAppendResult(LogAppendInfo.unknownLogAppendInfoWithLogStartOffset(logStartOffset), Some(t)))
@@ -1235,8 +1247,14 @@ class ReplicaManager(val config: KafkaConfig,
 
           partition.remoteReplicas.foreach { replica =>
             val replicaState = replica.stateSnapshot
-            // Exclude replicas that don't have the requested offset (whether or not if they're in the ISR)
-            if (replicaState.logEndOffset >= fetchOffset && replicaState.logStartOffset <= fetchOffset) {
+            // Exclude replicas that are not in the ISR as the follower may lag behind. Worst case, the follower
+            // will continue to lag and the consumer will fall behind the produce. The leader will
+            // continuously pick the lagging follower when the consumer refreshes its preferred read replica.
+            // This can go on indefinitely.
+            if (partition.inSyncReplicaIds.contains(replica.brokerId) &&
+                replicaState.logEndOffset >= fetchOffset &&
+                replicaState.logStartOffset <= fetchOffset) {
+
               replicaInfoSet.add(new DefaultReplicaView(
                 replicaEndpoints.getOrElse(replica.brokerId, Node.noNode()),
                 replicaState.logEndOffset,
@@ -1913,7 +1931,16 @@ class ReplicaManager(val config: KafkaConfig,
     if (checkpointHW)
       checkpointHighWatermarks()
     replicaSelectorOpt.foreach(_.close)
+    removeAllTopicMetrics()
     info("Shut down completely")
+  }
+
+  private def removeAllTopicMetrics(): Unit = {
+    val allTopics = new util.HashSet[String]
+    allPartitions.keys.foreach(partition =>
+      if (allTopics.add(partition.topic())) {
+        brokerTopicStats.removeMetrics(partition.topic())
+      })
   }
 
   protected def createReplicaFetcherManager(metrics: Metrics, time: Time, threadNamePrefix: Option[String], quotaManager: ReplicationQuotaManager) = {
@@ -2142,7 +2169,6 @@ class ReplicaManager(val config: KafkaConfig,
   ): Unit = {
     stateChangeLogger.info(s"Transitioning ${localFollowers.size} partition(s) to " +
       "local followers.")
-    val shuttingDown = isShuttingDown.get()
     val partitionsToStartFetching = new mutable.HashMap[TopicPartition, Partition]
     val partitionsToStopFetching = new mutable.HashMap[TopicPartition, Boolean]
     val followerTopicSet = new mutable.HashSet[String]
@@ -2151,28 +2177,24 @@ class ReplicaManager(val config: KafkaConfig,
         try {
           followerTopicSet.add(tp.topic)
 
-          if (shuttingDown) {
-            stateChangeLogger.trace(s"Unable to start fetching $tp with topic " +
-              s"ID ${info.topicId} because the replica manager is shutting down.")
-          } else {
-            // We always update the follower state.
-            // - This ensure that a replica with no leader can step down;
-            // - This also ensures that the local replica is created even if the leader
-            //   is unavailable. This is required to ensure that we include the partition's
-            //   high watermark in the checkpoint file (see KAFKA-1647).
-            val state = info.partition.toLeaderAndIsrPartitionState(tp, isNew)
-            val isNewLeaderEpoch = partition.makeFollower(state, offsetCheckpoints, Some(info.topicId))
+          // We always update the follower state.
+          // - This ensure that a replica with no leader can step down;
+          // - This also ensures that the local replica is created even if the leader
+          //   is unavailable. This is required to ensure that we include the partition's
+          //   high watermark in the checkpoint file (see KAFKA-1647).
+          val state = info.partition.toLeaderAndIsrPartitionState(tp, isNew)
+          val isNewLeaderEpoch = partition.makeFollower(state, offsetCheckpoints, Some(info.topicId))
 
-            if (isInControlledShutdown && (info.partition.leader == NO_LEADER ||
-                !info.partition.isr.contains(config.brokerId))) {
-              // During controlled shutdown, replica with no leaders and replica
-              // where this broker is not in the ISR are stopped.
-              partitionsToStopFetching.put(tp, false)
-            } else if (isNewLeaderEpoch) {
-              // Otherwise, fetcher is restarted if the leader epoch has changed.
-              partitionsToStartFetching.put(tp, partition)
-            }
+          if (isInControlledShutdown && (info.partition.leader == NO_LEADER ||
+              !info.partition.isr.contains(config.brokerId))) {
+            // During controlled shutdown, replica with no leaders and replica
+            // where this broker is not in the ISR are stopped.
+            partitionsToStopFetching.put(tp, false)
+          } else if (isNewLeaderEpoch) {
+            // Otherwise, fetcher is restarted if the leader epoch has changed.
+            partitionsToStartFetching.put(tp, partition)
           }
+
           changedPartitions.add(partition)
         } catch {
           case e: KafkaStorageException =>

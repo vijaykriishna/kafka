@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 import java.nio.file.{Files, NoSuchFileException, Paths}
 import java.util.Properties
 import kafka.server.epoch.{EpochEntry, LeaderEpochFileCache}
-import kafka.server.{BrokerTopicStats, FetchDataInfo, KafkaConfig, LogDirFailureChannel}
+import kafka.server.{BrokerTopicStats, FetchDataInfo, KafkaConfig}
 import kafka.server.metadata.MockConfigRepository
 import kafka.utils.{CoreUtils, MockTime, Scheduler, TestUtils}
 import org.apache.kafka.common.TopicPartition
@@ -31,6 +31,7 @@ import org.apache.kafka.common.record.{CompressionType, ControlRecordType, Defau
 import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.server.common.MetadataVersion
 import org.apache.kafka.server.common.MetadataVersion.IBP_0_11_0_IV0
+import org.apache.kafka.server.log.internals.{AbortedTxn, LogDirFailureChannel, OffsetIndex}
 import org.junit.jupiter.api.Assertions.{assertDoesNotThrow, assertEquals, assertFalse, assertNotEquals, assertThrows, assertTrue}
 import org.junit.jupiter.api.function.Executable
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
@@ -48,7 +49,7 @@ class LogLoaderTest {
   var config: KafkaConfig = _
   val brokerTopicStats = new BrokerTopicStats
   val maxTransactionTimeoutMs: Int = 5 * 60 * 1000
-  val maxProducerIdExpirationMs: Int = 60 * 60 * 1000
+  val producerStateManagerConfig: ProducerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs)
   val producerIdExpirationCheckIntervalMs: Int = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs
   val tmpDir = TestUtils.tempDir()
   val logDir = TestUtils.randomPartitionLogDir(tmpDir)
@@ -89,7 +90,6 @@ class LogLoaderTest {
     val logDirFailureChannel = new LogDirFailureChannel(logDirs.size)
 
     val maxTransactionTimeoutMs = 5 * 60 * 1000
-    val maxProducerIdExpirationMs = 60 * 60 * 1000
     val producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs
 
     // Create a LogManager with some overridden methods to facilitate interception of clean shutdown
@@ -110,7 +110,7 @@ class LogLoaderTest {
         flushStartOffsetCheckpointMs = 10000L,
         retentionCheckMs = 1000L,
         maxTransactionTimeoutMs = maxTransactionTimeoutMs,
-        maxPidExpirationMs = maxProducerIdExpirationMs,
+        producerStateManagerConfig = producerStateManagerConfig,
         producerIdExpirationCheckIntervalMs = producerIdExpirationCheckIntervalMs,
         interBrokerProtocolVersion = config.interBrokerProtocolVersion,
         scheduler = time.scheduler,
@@ -143,7 +143,7 @@ class LogLoaderTest {
           val segments = new LogSegments(topicPartition)
           val leaderEpochCache = UnifiedLog.maybeCreateLeaderEpochCache(logDir, topicPartition, logDirFailureChannel, config.recordVersion, "")
           val producerStateManager = new ProducerStateManager(topicPartition, logDir,
-            maxTransactionTimeoutMs, maxProducerIdExpirationMs, time)
+            maxTransactionTimeoutMs, producerStateManagerConfig, time)
           val logLoader = new LogLoader(logDir, topicPartition, config, time.scheduler, time,
             logDirFailureChannel, hadCleanShutdown, segments, logStartOffset, logRecoveryPoint,
             leaderEpochCache, producerStateManager)
@@ -248,11 +248,11 @@ class LogLoaderTest {
                         scheduler: Scheduler = mockTime.scheduler,
                         time: Time = mockTime,
                         maxTransactionTimeoutMs: Int = maxTransactionTimeoutMs,
-                        maxProducerIdExpirationMs: Int = maxProducerIdExpirationMs,
+                        maxProducerIdExpirationMs: Int = producerStateManagerConfig.producerIdExpirationMs,
                         producerIdExpirationCheckIntervalMs: Int = producerIdExpirationCheckIntervalMs,
                         lastShutdownClean: Boolean = true): UnifiedLog = {
     LogTestUtils.createLog(dir, config, brokerTopicStats, scheduler, time, logStartOffset, recoveryPoint,
-      maxTransactionTimeoutMs, maxProducerIdExpirationMs, producerIdExpirationCheckIntervalMs, lastShutdownClean)
+      maxTransactionTimeoutMs, new ProducerStateManagerConfig(maxProducerIdExpirationMs), producerIdExpirationCheckIntervalMs, lastShutdownClean)
   }
 
   private def createLogWithOffsetOverflow(logConfig: LogConfig): (UnifiedLog, LogSegment) = {
@@ -332,7 +332,6 @@ class LogLoaderTest {
 
     def createLogWithInterceptedReads(recoveryPoint: Long): UnifiedLog = {
       val maxTransactionTimeoutMs = 5 * 60 * 1000
-      val maxProducerIdExpirationMs = 60 * 60 * 1000
       val producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs
       val topicPartition = UnifiedLog.parseTopicPartitionName(logDir)
       val logDirFailureChannel = new LogDirFailureChannel(10)
@@ -358,7 +357,7 @@ class LogLoaderTest {
       }
       val leaderEpochCache = UnifiedLog.maybeCreateLeaderEpochCache(logDir, topicPartition, logDirFailureChannel, logConfig.recordVersion, "")
       val producerStateManager = new ProducerStateManager(topicPartition, logDir,
-        maxTransactionTimeoutMs, maxProducerIdExpirationMs, mockTime)
+        maxTransactionTimeoutMs, producerStateManagerConfig, mockTime)
       val logLoader = new LogLoader(
         logDir,
         topicPartition,
@@ -406,10 +405,10 @@ class LogLoaderTest {
   @Test
   def testSkipLoadingIfEmptyProducerStateBeforeTruncation(): Unit = {
     val maxTransactionTimeoutMs = 60000
-    val maxProducerIdExpirationMs = 300000
+    val producerStateManagerConfig = new ProducerStateManagerConfig(300000)
 
     val stateManager: ProducerStateManager = mock(classOf[ProducerStateManager])
-    when(stateManager.maxProducerIdExpirationMs).thenReturn(maxProducerIdExpirationMs)
+    when(stateManager.producerStateManagerConfig).thenReturn(producerStateManagerConfig)
     when(stateManager.maxTransactionTimeoutMs).thenReturn(maxTransactionTimeoutMs)
     when(stateManager.latestSnapshotOffset).thenReturn(None)
     when(stateManager.mapEndOffset).thenReturn(0L)
@@ -495,7 +494,7 @@ class LogLoaderTest {
       firstAppendTimestamp, coordinatorEpoch = coordinatorEpoch)
     assertEquals(firstAppendTimestamp, log.producerStateManager.lastEntry(producerId).get.lastTimestamp)
 
-    val maxProducerIdExpirationMs = 60 * 60 * 1000
+    val maxProducerIdExpirationMs = kafka.server.Defaults.ProducerIdExpirationMs
     mockTime.sleep(maxProducerIdExpirationMs)
     assertEquals(None, log.producerStateManager.lastEntry(producerId))
 
@@ -515,12 +514,12 @@ class LogLoaderTest {
   @Test
   def testSkipTruncateAndReloadIfOldMessageFormatAndNoCleanShutdown(): Unit = {
     val maxTransactionTimeoutMs = 60000
-    val maxProducerIdExpirationMs = 300000
+    val producerStateManagerConfig = new ProducerStateManagerConfig(300000)
 
     val stateManager: ProducerStateManager = mock(classOf[ProducerStateManager])
     when(stateManager.isEmpty).thenReturn(true)
     when(stateManager.firstUnstableOffset).thenReturn(None)
-    when(stateManager.maxProducerIdExpirationMs).thenReturn(maxProducerIdExpirationMs)
+    when(stateManager.producerStateManagerConfig).thenReturn(producerStateManagerConfig)
     when(stateManager.maxTransactionTimeoutMs).thenReturn(maxTransactionTimeoutMs)
 
     val topicPartition = UnifiedLog.parseTopicPartitionName(logDir)
@@ -569,12 +568,12 @@ class LogLoaderTest {
   @Test
   def testSkipTruncateAndReloadIfOldMessageFormatAndCleanShutdown(): Unit = {
     val maxTransactionTimeoutMs = 60000
-    val maxProducerIdExpirationMs = 300000
+    val producerStateManagerConfig = new ProducerStateManagerConfig(300000)
 
     val stateManager: ProducerStateManager = mock(classOf[ProducerStateManager])
     when(stateManager.isEmpty).thenReturn(true)
     when(stateManager.firstUnstableOffset).thenReturn(None)
-    when(stateManager.maxProducerIdExpirationMs).thenReturn(maxProducerIdExpirationMs)
+    when(stateManager.producerStateManagerConfig).thenReturn(producerStateManagerConfig)
     when(stateManager.maxTransactionTimeoutMs).thenReturn(maxTransactionTimeoutMs)
 
     val topicPartition = UnifiedLog.parseTopicPartitionName(logDir)
@@ -621,13 +620,13 @@ class LogLoaderTest {
   @Test
   def testSkipTruncateAndReloadIfNewMessageFormatAndCleanShutdown(): Unit = {
     val maxTransactionTimeoutMs = 60000
-    val maxProducerIdExpirationMs = 300000
+    val producerStateManagerConfig = new ProducerStateManagerConfig(300000)
 
     val stateManager: ProducerStateManager = mock(classOf[ProducerStateManager])
     when(stateManager.latestSnapshotOffset).thenReturn(None)
     when(stateManager.isEmpty).thenReturn(true)
     when(stateManager.firstUnstableOffset).thenReturn(None)
-    when(stateManager.maxProducerIdExpirationMs).thenReturn(maxProducerIdExpirationMs)
+    when(stateManager.producerStateManagerConfig).thenReturn(producerStateManagerConfig)
     when(stateManager.maxTransactionTimeoutMs).thenReturn(maxTransactionTimeoutMs)
 
     val topicPartition = UnifiedLog.parseTopicPartitionName(logDir)

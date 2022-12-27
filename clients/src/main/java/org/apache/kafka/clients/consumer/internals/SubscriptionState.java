@@ -620,7 +620,12 @@ public class SubscriptionState {
      * @return the removed preferred read replica if set, None otherwise.
      */
     public synchronized Optional<Integer> clearPreferredReadReplica(TopicPartition tp) {
-        return assignedState(tp).clearPreferredReadReplica();
+        final TopicPartitionState topicPartitionState = assignedStateOrNull(tp);
+        if (topicPartitionState == null) {
+            return Optional.empty();
+        } else {
+            return topicPartitionState.clearPreferredReadReplica();
+        }
     }
 
     public synchronized Map<TopicPartition, OffsetAndMetadata> allConsumed() {
@@ -738,6 +743,10 @@ public class SubscriptionState {
         assignedState(tp).pause();
     }
 
+    public synchronized void markPendingRevocation(Set<TopicPartition> tps) {
+        tps.forEach(tp -> assignedState(tp).markPendingRevocation());
+    }
+
     public synchronized void resume(TopicPartition tp) {
         assignedState(tp).resume();
     }
@@ -769,6 +778,7 @@ public class SubscriptionState {
         private Long logStartOffset; // the log start offset
         private Long lastStableOffset;
         private boolean paused;  // whether this partition has been paused by the user
+        private boolean pendingRevocation;
         private OffsetResetStrategy resetStrategy;  // the strategy to use if the offset needs resetting
         private Long nextRetryTimeMs;
         private Integer preferredReadReplica;
@@ -777,6 +787,7 @@ public class SubscriptionState {
         
         TopicPartitionState() {
             this.paused = false;
+            this.pendingRevocation = false;
             this.endOffsetRequested = false;
             this.fetchState = FetchStates.INITIALIZING;
             this.position = null;
@@ -966,12 +977,16 @@ public class SubscriptionState {
             this.paused = true;
         }
 
+        private void markPendingRevocation() {
+            this.pendingRevocation = true;
+        }
+
         private void resume() {
             this.paused = false;
         }
 
         private boolean isFetchable() {
-            return !paused && hasValidPosition();
+            return !paused && !pendingRevocation && hasValidPosition();
         }
 
         private void highWatermark(Long highWatermark) {

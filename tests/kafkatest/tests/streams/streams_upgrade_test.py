@@ -206,22 +206,16 @@ class StreamsUpgradeTest(Test):
         Starts 3 KafkaStreams instances with version <from_version> and upgrades one-by-one to <to_version>
         """
 
-        self.zk = ZookeeperService(self.test_context, num_nodes=1)
-        self.zk.start()
+        if KafkaVersion(from_version).supports_fk_joins() and KafkaVersion(to_version).supports_fk_joins():
+            extra_properties = {'test.run_fk_join': 'true'}
+        else:
+            extra_properties = {}
 
-        self.kafka = KafkaService(self.test_context, num_nodes=1, zk=self.zk, topics=self.topics)
-        self.kafka.start()
-
-        self.driver = StreamsSmokeTestDriverService(self.test_context, self.kafka)
-        self.driver.disable_auto_terminate()
-        self.processor1 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
-        self.processor2 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
-        self.processor3 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
+        self.set_up_services()
 
         self.driver.start()
-        self.start_all_nodes_with(from_version)
 
-        self.processors = [self.processor1, self.processor2, self.processor3]
+        self.start_all_nodes_with(from_version, extra_properties)
 
         counter = 1
         random.seed()
@@ -230,26 +224,16 @@ class StreamsUpgradeTest(Test):
         random.shuffle(self.processors)
         for p in self.processors:
             p.CLEAN_NODE_ENABLED = False
-            self.do_stop_start_bounce(p, from_version[:-2], to_version, counter)
+            self.do_stop_start_bounce(p, from_version[:-2], to_version, counter, extra_properties)
             counter = counter + 1
 
         # second rolling bounce
         random.shuffle(self.processors)
         for p in self.processors:
-            self.do_stop_start_bounce(p, None, to_version, counter)
+            self.do_stop_start_bounce(p, None, to_version, counter, extra_properties)
             counter = counter + 1
 
-        # shutdown
-        self.driver.stop()
-
-        random.shuffle(self.processors)
-        for p in self.processors:
-            node = p.node
-            with node.account.monitor_log(p.STDOUT_FILE) as monitor:
-                p.stop()
-                monitor.wait_until("UPGRADE-TEST-CLIENT-CLOSED",
-                                   timeout_sec=60,
-                                   err_msg="Never saw output 'UPGRADE-TEST-CLIENT-CLOSED' on" + str(node.account))
+        self.stop_and_await()
 
     @cluster(num_nodes=6)
     def test_version_probing_upgrade(self):
@@ -257,22 +241,11 @@ class StreamsUpgradeTest(Test):
         Starts 3 KafkaStreams instances, and upgrades one-by-one to "future version"
         """
 
-        self.zk = ZookeeperService(self.test_context, num_nodes=1)
-        self.zk.start()
-
-        self.kafka = KafkaService(self.test_context, num_nodes=1, zk=self.zk, topics=self.topics)
-        self.kafka.start()
-
-        self.driver = StreamsSmokeTestDriverService(self.test_context, self.kafka)
-        self.driver.disable_auto_terminate()
-        self.processor1 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
-        self.processor2 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
-        self.processor3 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
+        self.set_up_services()
 
         self.driver.start()
         self.start_all_nodes_with("") # run with TRUNK
 
-        self.processors = [self.processor1, self.processor2, self.processor3]
         self.old_processors = [self.processor1, self.processor2, self.processor3]
         self.upgraded_processors = []
 
@@ -287,7 +260,62 @@ class StreamsUpgradeTest(Test):
             current_generation = self.do_rolling_bounce(p, counter, current_generation)
             counter = counter + 1
 
-        # shutdown
+        self.stop_and_await()
+
+    @cluster(num_nodes=6)
+    @matrix(from_version=[str(LATEST_3_2), str(DEV_VERSION)], to_version=[str(DEV_VERSION)], upgrade=[True, False])
+    def test_upgrade_downgrade_state_updater(self, from_version, to_version, upgrade):
+        """
+        Starts 3 KafkaStreams instances, and enables / disables state restoration
+        for the instances in a rolling bounce.
+
+        Once same-thread state restoration is removed from the code, this test
+        should use different versions of the code.
+        """
+        if upgrade:
+            extra_properties_first = { '__state.updater.enabled__': 'false' }
+            first_version = from_version
+            extra_properties_second = { '__state.updater.enabled__': 'true' }
+            second_version = to_version
+        else:
+            extra_properties_first = { '__state.updater.enabled__': 'true' }
+            first_version = to_version
+            extra_properties_second = { '__state.updater.enabled__': 'false' }
+            second_version = from_version
+
+        self.set_up_services()
+
+        self.driver.start()
+        self.start_all_nodes_with(first_version, extra_properties_first)
+
+        counter = 1
+        random.seed()
+
+        # rolling bounce
+        random.shuffle(self.processors)
+        for p in self.processors:
+            p.CLEAN_NODE_ENABLED = True
+            self.do_stop_start_bounce(p, None, second_version, counter, extra_properties_second)
+            counter = counter + 1
+
+        self.stop_and_await()
+
+    def set_up_services(self):
+        self.zk = ZookeeperService(self.test_context, num_nodes=1)
+        self.zk.start()
+
+        self.kafka = KafkaService(self.test_context, num_nodes=1, zk=self.zk, topics=self.topics)
+        self.kafka.start()
+
+        self.driver = StreamsSmokeTestDriverService(self.test_context, self.kafka)
+        self.driver.disable_auto_terminate()
+        self.processor1 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
+        self.processor2 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
+        self.processor3 = StreamsUpgradeTestJobRunnerService(self.test_context, self.kafka)
+
+        self.processors = [self.processor1, self.processor2, self.processor3]
+
+    def stop_and_await(self):
         self.driver.stop()
 
         random.shuffle(self.processors)
@@ -308,11 +336,13 @@ class StreamsUpgradeTest(Test):
         else:
             return "Kafka version: " + version
 
-    def start_all_nodes_with(self, version):
+    def start_all_nodes_with(self, version, extra_properties = None):
+        if extra_properties is None:
+            extra_properties = {}
         kafka_version_str = self.get_version_string(version)
 
         # start first with <version>
-        self.prepare_for(self.processor1, version)
+        self.prepare_for(self.processor1, version, extra_properties)
         node1 = self.processor1.node
         with node1.account.monitor_log(self.processor1.STDOUT_FILE) as monitor:
             with node1.account.monitor_log(self.processor1.LOG_FILE) as log_monitor:
@@ -323,14 +353,14 @@ class StreamsUpgradeTest(Test):
                 monitor.wait_until(self.processed_data_msg,
                                    timeout_sec=60,
                                    err_msg="Never saw output '%s' on " % self.processed_data_msg + str(node1.account))
-                if KafkaVersion(version).supports_fk_joins():
+                if extra_properties.get('test.run_fk_join', False):
                     monitor.wait_until(self.processed_fk_msg,
                     timeout_sec=60,
                     err_msg="Never saw output '%s' on " % self.processed_fk_msg + str(node1.account))
 
 
         # start second with <version>
-        self.prepare_for(self.processor2, version)
+        self.prepare_for(self.processor2, version, extra_properties)
         node2 = self.processor2.node
         with node1.account.monitor_log(self.processor1.STDOUT_FILE) as first_monitor:
             with node2.account.monitor_log(self.processor2.STDOUT_FILE) as second_monitor:
@@ -345,13 +375,13 @@ class StreamsUpgradeTest(Test):
                     second_monitor.wait_until(self.processed_data_msg,
                                               timeout_sec=60,
                                               err_msg="Never saw output '%s' on " % self.processed_data_msg + str(node2.account))
-                    if KafkaVersion(version).supports_fk_joins():
+                    if extra_properties.get('test.run_fk_join', False):
                         second_monitor.wait_until(self.processed_fk_msg,
                         timeout_sec=60,
                         err_msg="Never saw output '%s' on " % self.processed_fk_msg + str(node2.account))
 
         # start third with <version>
-        self.prepare_for(self.processor3, version)
+        self.prepare_for(self.processor3, version, extra_properties)
         node3 = self.processor3.node
         with node1.account.monitor_log(self.processor1.STDOUT_FILE) as first_monitor:
             with node2.account.monitor_log(self.processor2.STDOUT_FILE) as second_monitor:
@@ -370,20 +400,25 @@ class StreamsUpgradeTest(Test):
                         third_monitor.wait_until(self.processed_data_msg,
                                                  timeout_sec=60,
                                                  err_msg="Never saw output '%s' on " % self.processed_data_msg + str(node3.account))
-                        if KafkaVersion(version).supports_fk_joins():
+                        if extra_properties.get('test.run_fk_join', False):
                             third_monitor.wait_until(self.processed_fk_msg,
                             timeout_sec=60,
                             err_msg="Never saw output '%s' on " % self.processed_fk_msg + str(node2.account))
 
     @staticmethod
-    def prepare_for(processor, version):
+    def prepare_for(processor, version, extra_properties):
         processor.node.account.ssh("rm -rf " + processor.PERSISTENT_ROOT, allow_fail=False)
+        for k, v in extra_properties.items():
+            processor.set_config(k, v)
         if version == str(DEV_VERSION):
             processor.set_version("")  # set to TRUNK
         else:
             processor.set_version(version)
 
-    def do_stop_start_bounce(self, processor, upgrade_from, new_version, counter):
+    def do_stop_start_bounce(self, processor, upgrade_from, new_version, counter, extra_properties = None):
+        if extra_properties is None:
+            extra_properties = {}
+
         kafka_version_str = self.get_version_string(new_version)
 
         first_other_processor = None
@@ -425,6 +460,8 @@ class StreamsUpgradeTest(Test):
         else:
             processor.set_version(new_version)
         processor.set_upgrade_from(upgrade_from)
+        for k, v in extra_properties.items():
+            processor.set_config(k, v)
 
         grep_metadata_error = "grep \"org.apache.kafka.streams.errors.TaskAssignmentException: unable to decode subscription data: version=2\" "
         with node.account.monitor_log(processor.STDOUT_FILE) as monitor:
@@ -453,6 +490,11 @@ class StreamsUpgradeTest(Test):
                         monitor.wait_until(self.processed_data_msg,
                                            timeout_sec=60,
                                            err_msg="Never saw output '%s' on " % self.processed_data_msg + str(node.account))
+
+                        if extra_properties.get('test.run_fk_join', False):
+                            monitor.wait_until(self.processed_fk_msg,
+                                               timeout_sec=60,
+                                               err_msg="Never saw output '%s' on " % self.processed_fk_msg + str(node.account))
 
 
     def do_rolling_bounce(self, processor, counter, current_generation):
@@ -503,8 +545,8 @@ class StreamsUpgradeTest(Test):
                     version_probing_message = "Sent a version " + str(highest_version + 1) + " subscription and got version " + str(highest_version) + " assignment back (successful version probing). Downgrade subscription metadata to commonly supported version " + str(highest_version) + " and trigger new rebalance."
                     end_of_upgrade_message = "Sent a version " + str(highest_version) + " subscription and group.s latest commonly supported version is " + str(highest_version + 1) + " (successful version probing and end of rolling upgrade). Upgrading subscription metadata version to " + str(highest_version + 1) + " for next rebalance."
                     end_of_upgrade_error_message = "Could not detect 'successful version probing and end of rolling upgrade' at upgraded node "
-                    followup_rebalance_message = "Triggering the followup rebalance scheduled for 0 ms."
-                    followup_rebalance_error_message = "Could not detect 'Triggering followup rebalance' at node "
+                    followup_rebalance_message = "Triggering the followup rebalance scheduled for"
+                    followup_rebalance_error_message = "Could not detect '" + followup_rebalance_message + "' at node "
                     if len(self.old_processors) > 0:
                         log_monitor.wait_until(version_probing_message,
                                                timeout_sec=60,

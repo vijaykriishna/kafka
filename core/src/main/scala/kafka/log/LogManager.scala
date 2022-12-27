@@ -18,6 +18,8 @@
 package kafka.log
 
 import kafka.log.LogConfig.MessageFormatVersion
+import kafka.log.remote.RemoteIndexCache
+
 import java.io._
 import java.nio.file.Files
 import java.util.concurrent._
@@ -40,6 +42,7 @@ import kafka.utils.Implicits._
 import java.util.Properties
 
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.server.log.internals.LogDirFailureChannel
 
 import scala.annotation.nowarn
 
@@ -65,7 +68,7 @@ class LogManager(logDirs: Seq[File],
                  val flushStartOffsetCheckpointMs: Long,
                  val retentionCheckMs: Long,
                  val maxTransactionTimeoutMs: Int,
-                 val maxPidExpirationMs: Int,
+                 val producerStateManagerConfig: ProducerStateManagerConfig,
                  val producerIdExpirationCheckIntervalMs: Int,
                  interBrokerProtocolVersion: MetadataVersion,
                  scheduler: Scheduler,
@@ -276,7 +279,7 @@ class LogManager(logDirs: Seq[File],
       logStartOffset = logStartOffset,
       recoveryPoint = logRecoveryPoint,
       maxTransactionTimeoutMs = maxTransactionTimeoutMs,
-      maxProducerIdExpirationMs = maxPidExpirationMs,
+      producerStateManagerConfig = producerStateManagerConfig,
       producerIdExpirationCheckIntervalMs = producerIdExpirationCheckIntervalMs,
       scheduler = scheduler,
       time = time,
@@ -390,7 +393,11 @@ class LogManager(logDirs: Seq[File],
         }
 
         val logsToLoad = Option(dir.listFiles).getOrElse(Array.empty).filter(logDir =>
-          logDir.isDirectory && UnifiedLog.parseTopicPartitionName(logDir).topic != KafkaRaftServer.MetadataTopic)
+          logDir.isDirectory &&
+            // Ignore remote-log-index-cache directory as that is index cache maintained by tiered storage subsystem
+            // but not any topic-partition dir.
+            !logDir.getName.equals(RemoteIndexCache.DirName) &&
+            UnifiedLog.parseTopicPartitionName(logDir).topic != KafkaRaftServer.MetadataTopic)
         numTotalLogs += logsToLoad.length
         numRemainingLogs.put(dir.getAbsolutePath, logsToLoad.length)
 
@@ -950,7 +957,7 @@ class LogManager(logDirs: Seq[File],
           logStartOffset = 0L,
           recoveryPoint = 0L,
           maxTransactionTimeoutMs = maxTransactionTimeoutMs,
-          maxProducerIdExpirationMs = maxPidExpirationMs,
+          producerStateManagerConfig = producerStateManagerConfig,
           producerIdExpirationCheckIntervalMs = producerIdExpirationCheckIntervalMs,
           scheduler = scheduler,
           time = time,
@@ -1074,6 +1081,9 @@ class LogManager(logDirs: Seq[File],
         throw new KafkaStorageException(s"The future replica for $topicPartition is offline")
 
       destLog.renameDir(UnifiedLog.logDirName(topicPartition), true)
+      // the metrics tags still contain "future", so we have to remove it.
+      // we will add metrics back after sourceLog remove the metrics
+      destLog.removeLogMetrics()
       destLog.updateHighWatermark(sourceLog.highWatermark)
 
       // Now that future replica has been successfully renamed to be the current replica
@@ -1095,6 +1105,7 @@ class LogManager(logDirs: Seq[File],
         checkpointRecoveryOffsetsInDir(logDir, logsToCheckpoint)
         checkpointLogStartOffsetsInDir(logDir, logsToCheckpoint)
         sourceLog.removeLogMetrics()
+        destLog.newMetrics()
         addLogToBeDeleted(sourceLog)
       } catch {
         case e: KafkaStorageException =>
@@ -1375,7 +1386,7 @@ object LogManager {
       flushStartOffsetCheckpointMs = config.logFlushStartOffsetCheckpointIntervalMs,
       retentionCheckMs = config.logCleanupIntervalMs,
       maxTransactionTimeoutMs = config.transactionMaxTimeoutMs,
-      maxPidExpirationMs = config.producerIdExpirationMs,
+      producerStateManagerConfig = new ProducerStateManagerConfig(config.producerIdExpirationMs),
       producerIdExpirationCheckIntervalMs = config.producerIdExpirationCheckIntervalMs,
       scheduler = kafkaScheduler,
       brokerTopicStats = brokerTopicStats,

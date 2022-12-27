@@ -850,6 +850,19 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
         if len(self.pids(node)) == 0:
             raise Exception("No process ids recorded on node %s" % node.account.hostname)
 
+    def upgrade_metadata_version(self, new_version):
+        self.run_features_command("upgrade", new_version)
+
+    def downgrade_metadata_version(self, new_version):
+        self.run_features_command("downgrade", new_version)
+
+    def run_features_command(self, op, new_version):
+        cmd = self.path.script("kafka-features.sh ")
+        cmd += "--bootstrap-server %s " % self.bootstrap_servers()
+        cmd += "%s --metadata %s" % (op, new_version)
+        self.logger.info("Running %s command...\n%s" % (op, cmd))
+        self.nodes[0].account.ssh(cmd)
+
     def pids(self, node):
         """Return process ids associated with running processes on the given node."""
         try:
@@ -1412,7 +1425,7 @@ class KafkaService(KafkaPathResolverMixin, JmxMixin, Service):
         self.logger.debug(output)
 
     def search_data_files(self, topic, messages):
-        """Check if a set of messages made it into the Kakfa data files. Note that
+        """Check if a set of messages made it into the Kafka data files. Note that
         this method takes no account of replication. It simply looks for the
         payload in all the partition files of the specified topic. 'messages' should be
         an array of numbers. The list of missing messages is returned.

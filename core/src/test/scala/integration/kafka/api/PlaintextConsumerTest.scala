@@ -637,7 +637,6 @@ class PlaintextConsumerTest extends BaseConsumerTest {
     assertEquals(0L, consumer.position(tp), "position() on a partition that we are subscribed to should reset the offset")
     consumer.commitSync()
     assertEquals(0L, consumer.committed(Set(tp).asJava).get(tp).offset)
-    
     consumeAndVerifyRecords(consumer = consumer, numRecords = 5, startingOffset = 0, startingTimestamp = startingTimestamp)
     assertEquals(5L, consumer.position(tp), "After consuming 5 records, position should be 5")
     consumer.commitSync()
@@ -673,7 +672,7 @@ class PlaintextConsumerTest extends BaseConsumerTest {
   @Test
   def testFetchInvalidOffset(): Unit = {
     this.consumerConfig.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none")
-    val consumer = createConsumer()
+    val consumer = createConsumer(configOverrides = this.consumerConfig)
 
     // produce one record
     val totalRecords = 2
@@ -693,6 +692,53 @@ class PlaintextConsumerTest extends BaseConsumerTest {
     assertNotNull(outOfRangePartitions)
     assertEquals(1, outOfRangePartitions.size)
     assertEquals(outOfRangePos.toLong, outOfRangePartitions.get(tp))
+  }
+
+  @Test
+  def testFetchOutOfRangeOffsetResetConfigEarliest(): Unit = {
+    this.consumerConfig.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+    // ensure no in-flight fetch request so that the offset can be reset immediately
+    this.consumerConfig.setProperty(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, "0")
+    val consumer = createConsumer(configOverrides = this.consumerConfig)
+    val totalRecords = 10L
+
+    val producer = createProducer()
+    val startingTimestamp = 0
+    sendRecords(producer, totalRecords.toInt, tp, startingTimestamp = startingTimestamp)
+    consumer.assign(List(tp).asJava)
+    consumeAndVerifyRecords(consumer = consumer, numRecords = totalRecords.toInt, startingOffset =0)
+    // seek to out of range position
+    val outOfRangePos = totalRecords + 1
+    consumer.seek(tp, outOfRangePos)
+    // assert that poll resets to the beginning position
+    consumeAndVerifyRecords(consumer = consumer, numRecords = 1, startingOffset = 0)
+  }
+
+
+  @Test
+  def testFetchOutOfRangeOffsetResetConfigLatest(): Unit = {
+    this.consumerConfig.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
+    // ensure no in-flight fetch request so that the offset can be reset immediately
+    this.consumerConfig.setProperty(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, "0")
+    val consumer = createConsumer(configOverrides = this.consumerConfig)
+    val totalRecords = 10L
+
+    val producer = createProducer()
+    val startingTimestamp = 0
+    sendRecords(producer, totalRecords.toInt, tp, startingTimestamp = startingTimestamp)
+    consumer.assign(List(tp).asJava)
+    consumer.seek(tp, 0)
+    // consume some, but not all of the records
+    consumeAndVerifyRecords(consumer = consumer, numRecords = totalRecords.toInt/2, startingOffset = 0)
+    // seek to out of range position
+    val outOfRangePos = totalRecords + 17 // arbitrary, much higher offset
+    consumer.seek(tp, outOfRangePos)
+    // assert that poll resets to the ending position
+    assertTrue(consumer.poll(Duration.ofMillis(50)).isEmpty)
+    sendRecords(producer, totalRecords.toInt, tp, startingTimestamp = totalRecords)
+    val nextRecord = consumer.poll(Duration.ofMillis(50)).iterator().next()
+    // ensure the seek went to the last known record at the time of the previous poll
+    assertEquals(totalRecords, nextRecord.offset())
   }
 
   @Test
@@ -1642,12 +1688,6 @@ class PlaintextConsumerTest extends BaseConsumerTest {
     servers.foreach(assertNoMetric(_, "throttle-time", QuotaType.Request, producerClientId))
     servers.foreach(assertNoMetric(_, "request-time", QuotaType.Request, consumerClientId))
     servers.foreach(assertNoMetric(_, "throttle-time", QuotaType.Request, consumerClientId))
-
-    def assertNoExemptRequestMetric(broker: KafkaServer): Unit = {
-        val metricName = broker.metrics.metricName("exempt-request-time", QuotaType.Request.toString, "")
-        assertNull(broker.metrics.metric(metricName), "Metric should not have been created " + metricName)
-    }
-    servers.foreach(assertNoExemptRequestMetric)
   }
 
   def runMultiConsumerSessionTimeoutTest(closeConsumer: Boolean): Unit = {
@@ -1908,6 +1948,23 @@ class PlaintextConsumerTest extends BaseConsumerTest {
     awaitAssignment(consumer2, Set(foo0, foo1))
 
     consumer2.close()
+  }
+
+  @Test
+  def testConsumerRackIdPropagatedToPartitionAssignor(): Unit = {
+    consumerConfig.setProperty(ConsumerConfig.CLIENT_RACK_CONFIG, "rack-a")
+    consumerConfig.setProperty(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, classOf[RackAwareAssignor].getName)
+    val consumer = createConsumer()
+    consumer.subscribe(Set(topic).asJava)
+    awaitAssignment(consumer, Set(tp, tp2))
+  }
+}
+
+class RackAwareAssignor extends RoundRobinAssignor {
+  override def assign(partitionsPerTopic: util.Map[String, Integer], subscriptions: util.Map[String, ConsumerPartitionAssignor.Subscription]): util.Map[String, util.List[TopicPartition]] = {
+    assertEquals(1, subscriptions.size())
+    assertEquals(Optional.of("rack-a"), subscriptions.values.asScala.head.rackId)
+    super.assign(partitionsPerTopic, subscriptions)
   }
 }
 

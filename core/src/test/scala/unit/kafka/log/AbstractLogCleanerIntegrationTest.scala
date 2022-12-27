@@ -19,12 +19,13 @@ package kafka.log
 import java.io.File
 import java.nio.file.Files
 import java.util.Properties
-import kafka.server.{BrokerTopicStats, LogDirFailureChannel}
+import kafka.server.BrokerTopicStats
 import kafka.utils.{MockTime, Pool, TestUtils}
 import kafka.utils.Implicits._
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.record.{CompressionType, MemoryRecords, RecordBatch}
 import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.server.log.internals.LogDirFailureChannel
 import org.junit.jupiter.api.{AfterEach, Tag}
 
 import scala.collection.Seq
@@ -110,7 +111,7 @@ abstract class AbstractLogCleanerIntegrationTest {
         time = time,
         brokerTopicStats = new BrokerTopicStats,
         maxTransactionTimeoutMs = 5 * 60 * 1000,
-        maxProducerIdExpirationMs = 60 * 60 * 1000,
+        producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs),
         producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs,
         logDirFailureChannel = new LogDirFailureChannel(10),
         topicId = None,
