@@ -22,15 +22,18 @@ import java.nio.channels.ClosedChannelException
 import java.nio.charset.StandardCharsets
 import java.util.regex.Pattern
 import java.util.Collections
-import kafka.server.{FetchDataInfo, KafkaConfig, LogOffsetMetadata}
-import kafka.utils.{MockTime, Scheduler, TestUtils}
+import kafka.server.KafkaConfig
+import kafka.utils.TestUtils
 import org.apache.kafka.common.{KafkaException, TopicPartition}
 import org.apache.kafka.common.errors.KafkaStorageException
 import org.apache.kafka.common.record.{CompressionType, MemoryRecords, Record, SimpleRecord}
 import org.apache.kafka.common.utils.{Time, Utils}
-import org.apache.kafka.server.log.internals.LogDirFailureChannel
-import org.junit.jupiter.api.Assertions.{assertFalse, _}
+import org.apache.kafka.server.util.{MockTime, Scheduler}
+import org.apache.kafka.storage.internals.log.{FetchDataInfo, LogConfig, LogDirFailureChannel, LogFileUtils, LogOffsetMetadata}
+import org.junit.jupiter.api.Assertions._
+import org.junit.jupiter.api.function.Executable
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
+import org.mockito.Mockito.{doReturn, spy}
 
 import scala.jdk.CollectionConverters._
 
@@ -611,14 +614,14 @@ class LocalLogTest {
   def testOffsetFromFile(): Unit = {
     val offset = 23423423L
 
-    val logFile = LocalLog.logFile(tmpDir, offset)
-    assertEquals(offset, LocalLog.offsetFromFile(logFile))
+    val logFile = LogFileUtils.logFile(tmpDir, offset)
+    assertEquals(offset, LogFileUtils.offsetFromFile(logFile))
 
-    val offsetIndexFile = LocalLog.offsetIndexFile(tmpDir, offset)
-    assertEquals(offset, LocalLog.offsetFromFile(offsetIndexFile))
+    val offsetIndexFile = LogFileUtils.offsetIndexFile(tmpDir, offset)
+    assertEquals(offset, LogFileUtils.offsetFromFile(offsetIndexFile))
 
-    val timeIndexFile = LocalLog.timeIndexFile(tmpDir, offset)
-    assertEquals(offset, LocalLog.offsetFromFile(timeIndexFile))
+    val timeIndexFile = LogFileUtils.timeIndexFile(tmpDir, offset)
+    assertEquals(offset, LogFileUtils.offsetFromFile(timeIndexFile))
   }
 
   @Test
@@ -698,6 +701,20 @@ class LocalLogTest {
     // expect an error because of attempt to roll to a new offset (1L) that's lower than the
     // base offset (3L) of the active segment
     assertThrows(classOf[KafkaException], () => log.roll())
+  }
+
+  @Test
+  def testFlushingNonExistentDir(): Unit = {
+    val spyLog = spy(log)
+
+    val record = new SimpleRecord(mockTime.milliseconds, "a".getBytes)
+    appendRecords(List(record))
+    mockTime.sleep(1)
+    val newSegment = log.roll()
+
+    // simulate the directory is renamed concurrently
+    doReturn(new File("__NON_EXISTENT__"), Nil: _*).when(spyLog).dir
+    assertDoesNotThrow((() => spyLog.flush(newSegment.baseOffset)): Executable)
   }
 
   private def createLocalLogWithActiveSegment(dir: File = logDir,

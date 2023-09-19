@@ -54,11 +54,21 @@ import scala.jdk.CollectionConverters._
 class BrokerLifecycleManager(
   val config: KafkaConfig,
   val time: Time,
-  val threadNamePrefix: Option[String],
-  val isZkBroker: Boolean = false
+  val threadNamePrefix: String,
+  val isZkBroker: Boolean
 ) extends Logging {
 
-  val logContext = new LogContext(s"[BrokerLifecycleManager id=${config.nodeId}] ")
+  private def logPrefix(): String = {
+    val builder = new StringBuilder("[BrokerLifecycleManager")
+    builder.append(" id=").append(config.nodeId)
+    if (isZkBroker) {
+      builder.append(" isZkBroker=true")
+    }
+    builder.append("] ")
+    builder.toString()
+  }
+
+  val logContext = new LogContext(logPrefix())
 
   this.logIdent = logContext.logPrefix()
 
@@ -175,22 +185,25 @@ class BrokerLifecycleManager(
    * The channel manager, or null if this manager has not been started yet.  This variable
    * can only be read or written from the event queue thread.
    */
-  private var _channelManager: BrokerToControllerChannelManager = _
+  private var _channelManager: NodeToControllerChannelManager = _
 
   /**
    * The event queue.
    */
-  private[server] val eventQueue = new KafkaEventQueue(time, logContext, threadNamePrefix.getOrElse(""))
+  private[server] val eventQueue = new KafkaEventQueue(time,
+    logContext,
+    threadNamePrefix + "lifecycle-manager-",
+    new ShutdownEvent())
 
   /**
    * Start the BrokerLifecycleManager.
    *
    * @param highestMetadataOffsetProvider Provides the current highest metadata offset.
-   * @param channelManager                The brokerToControllerChannelManager to use.
+   * @param channelManager                The NodeToControllerChannelManager to use.
    * @param clusterId                     The cluster ID.
    */
   def start(highestMetadataOffsetProvider: () => Long,
-            channelManager: BrokerToControllerChannelManager,
+            channelManager: NodeToControllerChannelManager,
             clusterId: String,
             advertisedListeners: ListenerCollection,
             supportedFeatures: util.Map[String, VersionRange]): Unit = {
@@ -239,7 +252,7 @@ class BrokerLifecycleManager(
    * Start shutting down the BrokerLifecycleManager, but do not block.
    */
   def beginShutdown(): Unit = {
-    eventQueue.beginShutdown("beginShutdown", new ShutdownEvent())
+    eventQueue.beginShutdown("beginShutdown");
   }
 
   /**
@@ -258,7 +271,7 @@ class BrokerLifecycleManager(
   }
 
   private class StartupEvent(highestMetadataOffsetProvider: () => Long,
-                     channelManager: BrokerToControllerChannelManager,
+                     channelManager: NodeToControllerChannelManager,
                      clusterId: String,
                      advertisedListeners: ListenerCollection,
                      supportedFeatures: util.Map[String, VersionRange]) extends EventQueue.Event {
@@ -271,7 +284,7 @@ class BrokerLifecycleManager(
       _advertisedListeners = advertisedListeners.duplicate()
       _supportedFeatures = new util.HashMap[String, VersionRange](supportedFeatures)
       if (!isZkBroker) {
-        // ZK brokers don't block on registration during startup
+        // Only KRaft brokers block on registration during startup
         eventQueue.scheduleDeferred("initialRegistrationTimeout",
           new DeadlineFunction(time.nanoseconds() + initialTimeoutNs),
           new RegistrationTimeoutEvent())
@@ -470,7 +483,7 @@ class BrokerLifecycleManager(
     override def run(): Unit = {
       if (!initialRegistrationSucceeded) {
         error("Shutting down because we were unable to register with the controller quorum.")
-        eventQueue.beginShutdown("registrationTimeout", new ShutdownEvent())
+        eventQueue.beginShutdown("registrationTimeout");
       }
     }
   }

@@ -17,12 +17,14 @@
 
 package kafka.log
 
-import kafka.server.{BrokerTopicStats, FetchLogEnd}
+import kafka.server.BrokerTopicStats
 import kafka.utils._
+import org.apache.kafka.common.config.TopicConfig
 import org.apache.kafka.common.record.{CompressionType, MemoryRecords, RecordBatch, SimpleRecord}
 import org.apache.kafka.common.utils.Utils
-import org.apache.kafka.server.log.internals.LogDirFailureChannel
 import org.apache.kafka.server.record.BrokerCompressionType
+import org.apache.kafka.server.util.MockTime
+import org.apache.kafka.storage.internals.log.{FetchIsolation, LogConfig, LogDirFailureChannel, ProducerStateManagerConfig}
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api._
 import org.junit.jupiter.params.ParameterizedTest
@@ -35,7 +37,7 @@ class BrokerCompressionTest {
   val tmpDir = TestUtils.tempDir()
   val logDir = TestUtils.randomPartitionLogDir(tmpDir)
   val time = new MockTime(0, 0)
-  val logConfig = LogConfig()
+  val logConfig = new LogConfig(new Properties)
 
   @AfterEach
   def tearDown(): Unit = {
@@ -50,18 +52,18 @@ class BrokerCompressionTest {
   def testBrokerSideCompression(messageCompression: String, brokerCompression: String): Unit = {
     val messageCompressionType = CompressionType.forName(messageCompression)
     val logProps = new Properties()
-    logProps.put(LogConfig.CompressionTypeProp, brokerCompression)
+    logProps.put(TopicConfig.COMPRESSION_TYPE_CONFIG, brokerCompression)
     /*configure broker-side compression  */
     val log = UnifiedLog(
       dir = logDir,
-      config = LogConfig(logProps),
+      config = new LogConfig(logProps),
       logStartOffset = 0L,
       recoveryPoint = 0L,
       scheduler = time.scheduler,
       time = time,
       brokerTopicStats = new BrokerTopicStats,
       maxTransactionTimeoutMs = 5 * 60 * 1000,
-      producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs),
+      producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs, false),
       producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs,
       logDirFailureChannel = new LogDirFailureChannel(10),
       topicId = None,
@@ -75,7 +77,7 @@ class BrokerCompressionTest {
     def readBatch(offset: Int): RecordBatch = {
       val fetchInfo = log.read(offset,
         maxLength = 4096,
-        isolation = FetchLogEnd,
+        isolation = FetchIsolation.LOG_END,
         minOneMessage = true)
       fetchInfo.records.batches.iterator.next()
     }

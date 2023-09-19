@@ -22,14 +22,16 @@ import java.nio._
 import java.nio.channels._
 import java.nio.file.StandardOpenOption
 import java.util.{Properties, Random}
-
 import joptsimple._
 import kafka.log._
 import kafka.server.BrokerTopicStats
 import kafka.utils._
+import org.apache.kafka.common.config.TopicConfig
 import org.apache.kafka.common.record._
 import org.apache.kafka.common.utils.{Time, Utils}
-import org.apache.kafka.server.log.internals.LogDirFailureChannel
+import org.apache.kafka.server.util.{KafkaScheduler, Scheduler}
+import org.apache.kafka.server.util.CommandLineUtils
+import org.apache.kafka.storage.internals.log.{LogConfig, LogDirFailureChannel, ProducerStateManagerConfig}
 
 import scala.math._
 
@@ -121,8 +123,8 @@ object TestLinearWriteSpeed {
       } else if(options.has(logOpt)) {
         val segmentSize = rand.nextInt(512)*1024*1024 + 64*1024*1024 // vary size to avoid herd effect
         val logProperties = new Properties()
-        logProperties.put(LogConfig.SegmentBytesProp, segmentSize: java.lang.Integer)
-        logProperties.put(LogConfig.FlushMessagesProp, flushInterval: java.lang.Long)
+        logProperties.put(TopicConfig.SEGMENT_BYTES_CONFIG, segmentSize: java.lang.Integer)
+        logProperties.put(TopicConfig.FLUSH_MESSAGES_INTERVAL_CONFIG, flushInterval: java.lang.Long)
         writables(i) = new LogWritable(new File(dir, "kafka-test-" + i), new LogConfig(logProperties), scheduler, messageSet)
       } else {
         System.err.println("Must specify what to write to with one of --log, --channel, or --mmap")
@@ -143,16 +145,16 @@ object TestLinearWriteSpeed {
     while(totalWritten + bufferSize < bytesToWrite) {
       val start = System.nanoTime
       val writeSize = writables((count % numFiles).toInt.abs).write()
-      val ellapsed = System.nanoTime - start
-      maxLatency = max(ellapsed, maxLatency)
-      totalLatency += ellapsed
+      val elapsed = System.nanoTime - start
+      maxLatency = max(elapsed, maxLatency)
+      totalLatency += elapsed
       written += writeSize
       count += 1
       totalWritten += writeSize
       if((start - lastReport)/(1000.0*1000.0) > reportingInterval.doubleValue) {
-        val ellapsedSecs = (start - lastReport) / (1000.0*1000.0*1000.0)
+        val elapsedSecs = (start - lastReport) / (1000.0*1000.0*1000.0)
         val mb = written / (1024.0*1024.0)
-        println("%10.3f\t%10.3f\t%10.3f".format(mb / ellapsedSecs, totalLatency / count.toDouble / (1000.0*1000.0), maxLatency / (1000.0 * 1000.0)))
+        println("%10.3f\t%10.3f\t%10.3f".format(mb / elapsedSecs, totalLatency / count.toDouble / (1000.0*1000.0), maxLatency / (1000.0 * 1000.0)))
         lastReport = start
         written = 0
         maxLatency = 0L
@@ -218,7 +220,7 @@ object TestLinearWriteSpeed {
       brokerTopicStats = new BrokerTopicStats,
       time = Time.SYSTEM,
       maxTransactionTimeoutMs = 5 * 60 * 1000,
-      producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs),
+      producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs, false),
       producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs,
       logDirFailureChannel = new LogDirFailureChannel(10),
       topicId = None,

@@ -19,7 +19,6 @@ package org.apache.kafka.connect.runtime;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.config.ConfigDef;
-import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.ConfigTransformer;
 import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.common.config.SaslConfigs;
@@ -32,15 +31,19 @@ import org.apache.kafka.connect.connector.policy.NoneConnectorClientConfigOverri
 import org.apache.kafka.connect.connector.policy.PrincipalConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.NotFoundException;
+import org.apache.kafka.connect.runtime.distributed.SampleConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
 import org.apache.kafka.connect.runtime.isolation.PluginDesc;
+import org.apache.kafka.connect.runtime.isolation.PluginType;
 import org.apache.kafka.connect.runtime.isolation.Plugins;
 import org.apache.kafka.connect.runtime.rest.entities.ConfigInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConfigInfos;
 import org.apache.kafka.connect.runtime.rest.entities.ConfigKeyInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConfigValueInfo;
-import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffset;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffsets;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorType;
 import org.apache.kafka.connect.runtime.rest.errors.BadRequestException;
 import org.apache.kafka.connect.storage.ClusterConfigState;
@@ -48,7 +51,9 @@ import org.apache.kafka.connect.storage.ConfigBackingStore;
 import org.apache.kafka.connect.storage.StatusBackingStore;
 import org.apache.kafka.connect.transforms.Transformation;
 import org.apache.kafka.connect.transforms.predicates.Predicate;
+import org.apache.kafka.connect.util.Callback;
 import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.FutureCallback;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
@@ -65,24 +70,29 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.apache.kafka.connect.runtime.AbstractHerder.keysWithVariableValues;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertThrows;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.when;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.withSettings;
-import static org.mockito.Mockito.CALLS_REAL_METHODS;
-import static org.mockito.Mockito.doNothing;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.times;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.withSettings;
 
 @RunWith(MockitoJUnitRunner.StrictStubs.class)
 public class AbstractHerderTest {
@@ -127,12 +137,28 @@ public class AbstractHerderTest {
         TASK_CONFIGS_MAP.put(TASK1, TASK_CONFIG);
         TASK_CONFIGS_MAP.put(TASK2, TASK_CONFIG);
     }
-    private static final ClusterConfigState SNAPSHOT = new ClusterConfigState(1, null, Collections.singletonMap(CONN1, 3),
-            Collections.singletonMap(CONN1, CONN1_CONFIG), Collections.singletonMap(CONN1, TargetState.STARTED),
-            TASK_CONFIGS_MAP, Collections.emptyMap(), Collections.emptyMap(), Collections.emptySet(), Collections.emptySet());
-    private static final ClusterConfigState SNAPSHOT_NO_TASKS = new ClusterConfigState(1, null, Collections.singletonMap(CONN1, 3),
-            Collections.singletonMap(CONN1, CONN1_CONFIG), Collections.singletonMap(CONN1, TargetState.STARTED),
-            Collections.emptyMap(), Collections.emptyMap(), Collections.emptyMap(), Collections.emptySet(), Collections.emptySet());
+    private static final ClusterConfigState SNAPSHOT = new ClusterConfigState(
+            1,
+            null,
+            Collections.singletonMap(CONN1, 3),
+            Collections.singletonMap(CONN1, CONN1_CONFIG),
+            Collections.singletonMap(CONN1, TargetState.STARTED),
+            TASK_CONFIGS_MAP,
+            Collections.emptyMap(),
+            Collections.emptyMap(),
+            Collections.emptySet(),
+            Collections.emptySet());
+    private static final ClusterConfigState SNAPSHOT_NO_TASKS = new ClusterConfigState(
+            1,
+            null,
+            Collections.singletonMap(CONN1, 3),
+            Collections.singletonMap(CONN1, CONN1_CONFIG),
+            Collections.singletonMap(CONN1, TargetState.STARTED),
+            Collections.emptyMap(),
+            Collections.emptyMap(),
+            Collections.emptyMap(),
+            Collections.emptySet(),
+            Collections.emptySet());
 
     private final String workerId = "workerId";
     private final String kafkaClusterId = "I4ZmrWqfT2e-upky_4fdPA";
@@ -156,6 +182,18 @@ public class AbstractHerderTest {
 
         when(configStore.snapshot()).thenReturn(SNAPSHOT);
         assertEquals(Collections.singleton(CONN1), new HashSet<>(herder.connectors()));
+    }
+
+    @Test
+    public void testConnectorClientConfigOverridePolicyClose() {
+        SampleConnectorClientConfigOverridePolicy noneConnectorClientConfigOverridePolicy = new SampleConnectorClientConfigOverridePolicy();
+
+        AbstractHerder herder = mock(AbstractHerder.class, withSettings()
+            .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
+            .defaultAnswer(CALLS_REAL_METHODS));
+
+        herder.stopServices();
+        assertTrue(noneConnectorClientConfigOverridePolicy.isClosed());
     }
 
     @Test
@@ -246,6 +284,32 @@ public class AbstractHerderTest {
         assertEquals(CONN1_CONFIG, info.config());
         assertEquals(Arrays.asList(TASK0, TASK1, TASK2), info.tasks());
         assertEquals(ConnectorType.SOURCE, info.type());
+    }
+
+    @Test
+    public void testPauseConnector() {
+        AbstractHerder herder = mock(AbstractHerder.class, withSettings()
+                .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
+                .defaultAnswer(CALLS_REAL_METHODS));
+
+        when(configStore.contains(CONN1)).thenReturn(true);
+
+        herder.pauseConnector(CONN1);
+
+        verify(configStore).putTargetState(CONN1, TargetState.PAUSED);
+    }
+
+    @Test
+    public void testResumeConnector() {
+        AbstractHerder herder = mock(AbstractHerder.class, withSettings()
+                .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
+                .defaultAnswer(CALLS_REAL_METHODS));
+
+        when(configStore.contains(CONN1)).thenReturn(true);
+
+        herder.resumeConnector(CONN1);
+
+        verify(configStore).putTargetState(CONN1, TargetState.STARTED);
     }
 
     @Test
@@ -452,7 +516,15 @@ public class AbstractHerderTest {
         config.put(SinkConnectorConfig.TOPICS_CONFIG, "topic1,topic2");
         config.put(SinkConnectorConfig.TOPICS_REGEX_CONFIG, "topic.*");
 
-        assertThrows(ConfigException.class, () -> herder.validateConnectorConfig(config, false));
+        ConfigInfos validation = herder.validateConnectorConfig(config, false);
+
+        ConfigInfo topicsListInfo = findInfo(validation, SinkConnectorConfig.TOPICS_CONFIG);
+        assertNotNull(topicsListInfo);
+        assertEquals(1, topicsListInfo.configValue().errors().size());
+
+        ConfigInfo topicsRegexInfo = findInfo(validation, SinkConnectorConfig.TOPICS_REGEX_CONFIG);
+        assertNotNull(topicsRegexInfo);
+        assertEquals(1, topicsRegexInfo.configValue().errors().size());
 
         verifyValidationIsolation();
     }
@@ -467,7 +539,11 @@ public class AbstractHerderTest {
         config.put(SinkConnectorConfig.TOPICS_CONFIG, "topic1");
         config.put(SinkConnectorConfig.DLQ_TOPIC_NAME_CONFIG, "topic1");
 
-        assertThrows(ConfigException.class, () -> herder.validateConnectorConfig(config, false));
+        ConfigInfos validation = herder.validateConnectorConfig(config, false);
+
+        ConfigInfo topicsListInfo = findInfo(validation, SinkConnectorConfig.TOPICS_CONFIG);
+        assertNotNull(topicsListInfo);
+        assertEquals(1, topicsListInfo.configValue().errors().size());
 
         verifyValidationIsolation();
     }
@@ -482,7 +558,11 @@ public class AbstractHerderTest {
         config.put(SinkConnectorConfig.TOPICS_REGEX_CONFIG, "topic.*");
         config.put(SinkConnectorConfig.DLQ_TOPIC_NAME_CONFIG, "topic1");
 
-        assertThrows(ConfigException.class, () -> herder.validateConnectorConfig(config, false));
+        ConfigInfos validation = herder.validateConnectorConfig(config, false);
+
+        ConfigInfo topicsRegexInfo = findInfo(validation, SinkConnectorConfig.TOPICS_REGEX_CONFIG);
+        assertNotNull(topicsRegexInfo);
+        assertEquals(1, topicsRegexInfo.configValue().errors().size());
 
         verifyValidationIsolation();
     }
@@ -522,7 +602,7 @@ public class AbstractHerderTest {
                 "Transforms: xformB"
         );
         assertEquals(expectedGroups, result.groups());
-        assertEquals(2, result.errorCount());
+        assertEquals(1, result.errorCount());
         Map<String, ConfigInfo> infos = result.values().stream()
                 .collect(Collectors.toMap(info -> info.configKey().name(), Function.identity()));
         assertEquals(26, infos.size());
@@ -579,7 +659,7 @@ public class AbstractHerderTest {
                 "Predicates: predY"
         );
         assertEquals(expectedGroups, result.groups());
-        assertEquals(2, result.errorCount());
+        assertEquals(1, result.errorCount());
         Map<String, ConfigInfo> infos = result.values().stream()
                 .collect(Collectors.toMap(info -> info.configKey().name(), Function.identity()));
         assertEquals(28, infos.size());
@@ -603,12 +683,12 @@ public class AbstractHerderTest {
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     private PluginDesc<Predicate<?>> predicatePluginDesc() {
-        return new PluginDesc(SamplePredicate.class, "1.0", classLoader);
+        return new PluginDesc(SamplePredicate.class, "1.0", PluginType.PREDICATE, classLoader);
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     private PluginDesc<Transformation<?>> transformationPluginDesc() {
-        return new PluginDesc(SampleTransformation.class, "1.0", classLoader);
+        return new PluginDesc(SampleTransformation.class, "1.0", PluginType.TRANSFORMATION, classLoader);
     }
 
     @Test
@@ -886,48 +966,108 @@ public class AbstractHerderTest {
     }
 
     @Test
-    public void testConnectorPluginConfig() throws Exception {
+    public void testSinkConnectorPluginConfig() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "sink",
+                SampleSinkConnector::new,
+                SampleSinkConnector::config,
+                Optional.of(SinkConnectorConfig.configDef())
+        );
+    }
 
+    @Test
+    public void testSinkConnectorPluginConfigIncludingCommon() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "sink",
+                SampleSinkConnector::new,
+                SampleSinkConnector::configWithCommon,
+                Optional.empty()
+        );
+    }
+
+    @Test
+    public void testSourceConnectorPluginConfig() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "source",
+                SampleSourceConnector::new,
+                SampleSourceConnector::config,
+                Optional.of(SourceConnectorConfig.configDef())
+        );
+    }
+
+    @Test
+    public void testSourceConnectorPluginConfigIncludingCommon() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "source",
+                SampleSourceConnector::new,
+                SampleSourceConnector::configWithCommon,
+                Optional.empty()
+        );
+    }
+
+    @Test
+    public void testConverterPluginConfig() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "converter",
+                SampleConverterWithHeaders::new,
+                SampleConverterWithHeaders::config,
+                Optional.empty()
+        );
+    }
+
+    @Test
+    public void testHeaderConverterPluginConfig() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "header-converter",
+                SampleHeaderConverter::new,
+                SampleHeaderConverter::config,
+                Optional.empty()
+        );
+    }
+
+    @Test
+    public void testPredicatePluginConfig() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "predicate",
+                SamplePredicate::new,
+                SamplePredicate::config,
+                Optional.empty()
+        );
+    }
+
+    @Test
+    public void testTransformationPluginConfig() throws ClassNotFoundException {
+        testConnectorPluginConfig(
+                "transformation",
+                SampleTransformation::new,
+                SampleTransformation::config,
+                Optional.empty()
+        );
+    }
+
+    private <T> void testConnectorPluginConfig(
+            String pluginName,
+            Supplier<T> newPluginInstance,
+            Function<T, ConfigDef> pluginConfig,
+            Optional<ConfigDef> baseConfig
+    ) throws ClassNotFoundException {
         AbstractHerder herder = mock(AbstractHerder.class, withSettings()
                 .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
                 .defaultAnswer(CALLS_REAL_METHODS));
 
-        when(plugins.newPlugin(anyString())).then(invocation -> {
-            String name = invocation.getArgument(0);
-            switch (name) {
-                case "sink": return new SampleSinkConnector();
-                case "source": return new SampleSourceConnector();
-                case "converter": return new SampleConverterWithHeaders();
-                case "header-converter": return new SampleHeaderConverter();
-                case "predicate": return new SamplePredicate();
-                default: return new SampleTransformation<>();
-            }
-        });
+        when(plugins.pluginClass(pluginName)).then(invocation -> newPluginInstance.get().getClass());
+        when(plugins.newPlugin(anyString())).then(invocation -> newPluginInstance.get());
         when(herder.plugins()).thenReturn(plugins);
 
-        List<ConfigKeyInfo> sinkConnectorConfigs = herder.connectorPluginConfig("sink");
-        assertNotNull(sinkConnectorConfigs);
-        assertEquals(new SampleSinkConnector().config().names().size(), sinkConnectorConfigs.size());
+        List<ConfigKeyInfo> configs = herder.connectorPluginConfig(pluginName);
+        assertNotNull(configs);
 
-        List<ConfigKeyInfo> sourceConnectorConfigs = herder.connectorPluginConfig("source");
-        assertNotNull(sourceConnectorConfigs);
-        assertEquals(new SampleSourceConnector().config().names().size(), sourceConnectorConfigs.size());
-
-        List<ConfigKeyInfo> converterConfigs = herder.connectorPluginConfig("converter");
-        assertNotNull(converterConfigs);
-        assertEquals(new SampleConverterWithHeaders().config().names().size(), converterConfigs.size());
-
-        List<ConfigKeyInfo> headerConverterConfigs = herder.connectorPluginConfig("header-converter");
-        assertNotNull(headerConverterConfigs);
-        assertEquals(new SampleHeaderConverter().config().names().size(), headerConverterConfigs.size());
-
-        List<ConfigKeyInfo> predicateConfigs = herder.connectorPluginConfig("predicate");
-        assertNotNull(predicateConfigs);
-        assertEquals(new SamplePredicate().config().names().size(), predicateConfigs.size());
-
-        List<ConfigKeyInfo> transformationConfigs = herder.connectorPluginConfig("transformation");
-        assertNotNull(transformationConfigs);
-        assertEquals(new SampleTransformation<>().config().names().size(), transformationConfigs.size());
+        ConfigDef expectedConfig = pluginConfig.apply(newPluginInstance.get());
+        int expectedConfigSize = baseConfig.map(config -> config.names().size()).orElse(0)
+                + expectedConfig.names().size();
+        assertEquals(expectedConfigSize, configs.size());
+        // Make sure that we used the correct class loader when interacting with the plugin
+        verify(plugins).withClassLoader(newPluginInstance.get().getClass().getClassLoader());
     }
 
     @Test(expected = NotFoundException.class)
@@ -937,17 +1077,19 @@ public class AbstractHerderTest {
                 .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
                 .defaultAnswer(CALLS_REAL_METHODS));
         when(worker.getPlugins()).thenReturn(plugins);
-        when(plugins.newPlugin(anyString())).thenThrow(new ClassNotFoundException());
+        when(plugins.pluginClass(anyString())).thenThrow(new ClassNotFoundException());
         herder.connectorPluginConfig(connName);
     }
 
     @Test(expected = BadRequestException.class)
+    @SuppressWarnings({"rawtypes", "unchecked"})
     public void testGetConnectorConfigDefWithInvalidPluginType() throws Exception {
         String connName = "AnotherPlugin";
         AbstractHerder herder = mock(AbstractHerder.class, withSettings()
                 .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
                 .defaultAnswer(CALLS_REAL_METHODS));
         when(worker.getPlugins()).thenReturn(plugins);
+        when(plugins.pluginClass(anyString())).thenReturn((Class) Object.class);
         when(plugins.newPlugin(anyString())).thenReturn(new DirectoryConfigProvider());
         herder.connectorPluginConfig(connName);
     }
@@ -977,6 +1119,40 @@ public class AbstractHerderTest {
                 .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
                 .defaultAnswer(CALLS_REAL_METHODS));
         assertEquals(ConnectorType.UNKNOWN, herder.connectorType(Collections.emptyMap()));
+    }
+
+    @Test
+    public void testConnectorOffsetsConnectorNotFound() {
+        when(configStore.snapshot()).thenReturn(SNAPSHOT);
+        AbstractHerder herder = mock(AbstractHerder.class, withSettings()
+                .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
+                .defaultAnswer(CALLS_REAL_METHODS));
+        FutureCallback<ConnectorOffsets> cb = new FutureCallback<>();
+        herder.connectorOffsets("unknown-connector", cb);
+        ExecutionException e = assertThrows(ExecutionException.class, () -> cb.get(1000, TimeUnit.MILLISECONDS));
+        assertEquals(NotFoundException.class, e.getCause().getClass());
+    }
+
+    @Test
+    public void testConnectorOffsets() throws Exception {
+        ConnectorOffsets offsets = new ConnectorOffsets(Arrays.asList(
+                new ConnectorOffset(Collections.singletonMap("partitionKey", "partitionValue"), Collections.singletonMap("offsetKey", "offsetValue")),
+                new ConnectorOffset(Collections.singletonMap("partitionKey", "partitionValue2"), Collections.singletonMap("offsetKey", "offsetValue"))
+        ));
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Callback<ConnectorOffsets>> workerCallback = ArgumentCaptor.forClass(Callback.class);
+        doAnswer(invocation -> {
+            workerCallback.getValue().onCompletion(null, offsets);
+            return null;
+        }).when(worker).connectorOffsets(eq(CONN1), eq(CONN1_CONFIG), workerCallback.capture());
+        AbstractHerder herder = mock(AbstractHerder.class, withSettings()
+                .useConstructor(worker, workerId, kafkaClusterId, statusStore, configStore, noneConnectorClientConfigOverridePolicy)
+                .defaultAnswer(CALLS_REAL_METHODS));
+        when(configStore.snapshot()).thenReturn(SNAPSHOT);
+
+        FutureCallback<ConnectorOffsets> cb = new FutureCallback<>();
+        herder.connectorOffsets(CONN1, cb);
+        assertEquals(offsets, cb.get(1000, TimeUnit.MILLISECONDS));
     }
 
     protected void addConfigKey(Map<String, ConfigDef.ConfigKey> keys, String name, String group) {

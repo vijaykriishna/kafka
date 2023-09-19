@@ -20,7 +20,7 @@ package kafka.log
 import java.io.File
 import kafka.utils.TestUtils
 import org.apache.kafka.common.errors.InvalidOffsetException
-import org.apache.kafka.server.log.internals.{CorruptIndexException, TimeIndex, TimestampOffset}
+import org.apache.kafka.storage.internals.log.{CorruptIndexException, TimeIndex, TimestampOffset}
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows}
 
@@ -34,7 +34,7 @@ class TimeIndexTest {
 
   @BeforeEach
   def setup(): Unit = {
-    this.idx = new TimeIndex(nonExistantTempFile(), baseOffset, maxEntries * 12)
+    this.idx = new TimeIndex(nonExistentTempFile(), baseOffset, maxEntries * 12)
   }
 
   @AfterEach
@@ -97,7 +97,7 @@ class TimeIndexTest {
       idx.maybeAppend(i * 10, i * 10 + baseOffset)
   }
 
-  def nonExistantTempFile(): File = {
+  def nonExistentTempFile(): File = {
     val file = TestUtils.tempFile()
     file.delete()
     file

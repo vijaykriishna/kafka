@@ -18,12 +18,12 @@
 package kafka.log
 
 import com.yammer.metrics.core.{Gauge, MetricName}
-import kafka.log.remote.RemoteIndexCache
 import kafka.server.checkpoints.OffsetCheckpointFile
 import kafka.server.metadata.{ConfigRepository, MockConfigRepository}
-import kafka.server.{BrokerTopicStats, FetchDataInfo, FetchLogEnd}
+import kafka.server.BrokerTopicStats
 import kafka.utils._
 import org.apache.directory.api.util.FileUtils
+import org.apache.kafka.common.config.TopicConfig
 import org.apache.kafka.common.errors.OffsetOutOfRangeException
 import org.apache.kafka.common.utils.Utils
 import org.apache.kafka.common.{KafkaException, TopicPartition}
@@ -37,8 +37,9 @@ import java.io._
 import java.nio.file.Files
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap, Future}
 import java.util.{Collections, Properties}
-import org.apache.kafka.server.log.internals.LogDirFailureChannel
 import org.apache.kafka.server.metrics.KafkaYammerMetrics
+import org.apache.kafka.server.util.MockTime
+import org.apache.kafka.storage.internals.log.{FetchDataInfo, FetchIsolation, LogConfig, LogDirFailureChannel, ProducerStateManagerConfig, RemoteIndexCache}
 
 import scala.collection.{Map, mutable}
 import scala.collection.mutable.ArrayBuffer
@@ -51,11 +52,10 @@ class LogManagerTest {
   val maxRollInterval = 100
   val maxLogAgeMs = 10 * 60 * 1000
   val logProps = new Properties()
-  logProps.put(LogConfig.SegmentBytesProp, 1024: java.lang.Integer)
-  logProps.put(LogConfig.SegmentIndexBytesProp, 4096: java.lang.Integer)
-  logProps.put(LogConfig.RetentionMsProp, maxLogAgeMs: java.lang.Integer)
-  logProps.put(LogConfig.MessageTimestampDifferenceMaxMsProp, Long.MaxValue.toString)
-  val logConfig = LogConfig(logProps)
+  logProps.put(TopicConfig.SEGMENT_BYTES_CONFIG, 1024: java.lang.Integer)
+  logProps.put(TopicConfig.SEGMENT_INDEX_BYTES_CONFIG, 4096: java.lang.Integer)
+  logProps.put(TopicConfig.RETENTION_MS_CONFIG, maxLogAgeMs: java.lang.Integer)
+  val logConfig = new LogConfig(logProps)
   var logDir: File = _
   var logManager: LogManager = _
   val name = "kafka"
@@ -134,6 +134,59 @@ class LogManagerTest {
     } finally {
       logManagerForTest.foreach(manager => manager.liveLogDirs.foreach(Utils.delete))
     }
+  }
+
+  /*
+   * Test that LogManager.shutdown() doesn't create clean shutdown file for a log directory that has not completed
+   * recovery.
+   */
+  @Test
+  def testCleanShutdownFileWhenShutdownCalledBeforeStartupComplete(): Unit = {
+    // 1. create two logs under logDir
+    val topicPartition0 = new TopicPartition(name, 0)
+    val topicPartition1 = new TopicPartition(name, 1)
+    val log0 = logManager.getOrCreateLog(topicPartition0, topicId = None)
+    val log1 = logManager.getOrCreateLog(topicPartition1, topicId = None)
+    val logFile0 = new File(logDir, name + "-0")
+    val logFile1 = new File(logDir, name + "-1")
+    assertTrue(logFile0.exists)
+    assertTrue(logFile1.exists)
+
+    log0.appendAsLeader(TestUtils.singletonRecords("test1".getBytes()), leaderEpoch = 0)
+    log0.takeProducerSnapshot()
+
+    log1.appendAsLeader(TestUtils.singletonRecords("test1".getBytes()), leaderEpoch = 0)
+    log1.takeProducerSnapshot()
+
+    // 2. simulate unclean shutdown by deleting clean shutdown marker file
+    logManager.shutdown()
+    assertTrue(Files.deleteIfExists(new File(logDir, LogLoader.CleanShutdownFile).toPath))
+
+    // 3. create a new LogManager and start it in a different thread
+    @volatile var loadLogCalled = 0
+    logManager = spy(createLogManager())
+    doAnswer { invocation =>
+      // intercept LogManager.loadLog to sleep 5 seconds so that there is enough time to call LogManager.shutdown
+      // before LogManager.startup completes.
+      Thread.sleep(5000)
+      invocation.callRealMethod().asInstanceOf[UnifiedLog]
+      loadLogCalled = loadLogCalled + 1
+    }.when(logManager).loadLog(any[File], any[Boolean], any[Map[TopicPartition, Long]], any[Map[TopicPartition, Long]],
+      any[LogConfig], any[Map[String, LogConfig]], any[ConcurrentMap[String, Int]])
+
+    val t = new Thread() {
+      override def run(): Unit = { logManager.startup(Set.empty) }
+    }
+    t.start()
+
+    // 4. shutdown LogManager after the first log is loaded but before the second log is loaded
+    TestUtils.waitUntilTrue(() => loadLogCalled == 1,
+      "Timed out waiting for only the first log to be loaded")
+    logManager.shutdown()
+    logManager = null
+
+    // 5. verify that CleanShutdownFile is not created under logDir
+    assertFalse(Files.exists(new File(logDir, LogLoader.CleanShutdownFile).toPath))
   }
 
   /**
@@ -251,8 +304,8 @@ class LogManagerTest {
     logManager.shutdown()
     val segmentBytes = 10 * setSize
     val properties = new Properties()
-    properties.put(LogConfig.SegmentBytesProp, segmentBytes.toString)
-    properties.put(LogConfig.RetentionBytesProp, (5L * 10L * setSize + 10L).toString)
+    properties.put(TopicConfig.SEGMENT_BYTES_CONFIG, segmentBytes.toString)
+    properties.put(TopicConfig.RETENTION_BYTES_CONFIG, (5L * 10L * setSize + 10L).toString)
     val configRepository = MockConfigRepository.forTopic(name, properties)
 
     logManager = createLogManager(configRepository = configRepository)
@@ -293,7 +346,7 @@ class LogManagerTest {
     */
   @Test
   def testDoesntCleanLogsWithCompactDeletePolicy(): Unit = {
-    testDoesntCleanLogs(LogConfig.Compact + "," + LogConfig.Delete)
+    testDoesntCleanLogs(TopicConfig.CLEANUP_POLICY_COMPACT + "," + TopicConfig.CLEANUP_POLICY_DELETE)
   }
 
   /**
@@ -302,12 +355,12 @@ class LogManagerTest {
     */
   @Test
   def testDoesntCleanLogsWithCompactPolicy(): Unit = {
-    testDoesntCleanLogs(LogConfig.Compact)
+    testDoesntCleanLogs(TopicConfig.CLEANUP_POLICY_COMPACT)
   }
 
   private def testDoesntCleanLogs(policy: String): Unit = {
     logManager.shutdown()
-    val configRepository = MockConfigRepository.forTopic(name, LogConfig.CleanupPolicyProp, policy)
+    val configRepository = MockConfigRepository.forTopic(name, TopicConfig.CLEANUP_POLICY_CONFIG, policy)
 
     logManager = createLogManager(configRepository = configRepository)
     val log = logManager.getOrCreateLog(new TopicPartition(name, 0), topicId = None)
@@ -333,7 +386,7 @@ class LogManagerTest {
   @Test
   def testTimeBasedFlush(): Unit = {
     logManager.shutdown()
-    val configRepository = MockConfigRepository.forTopic(name, LogConfig.FlushMsProp, "1000")
+    val configRepository = MockConfigRepository.forTopic(name, TopicConfig.FLUSH_MS_CONFIG, "1000")
 
     logManager = createLogManager(configRepository = configRepository)
     logManager.startup(Set.empty)
@@ -374,7 +427,7 @@ class LogManagerTest {
   @Test
   def testLoadLogsSkipRemoteIndexCache(): Unit = {
     val logDir = TestUtils.tempDir()
-    val remoteIndexCache = new File(logDir, RemoteIndexCache.DirName)
+    val remoteIndexCache = new File(logDir, RemoteIndexCache.DIR_NAME)
     remoteIndexCache.mkdir()
     logManager = createLogManager(Seq(logDir))
     logManager.loadLogs(logConfig, Map.empty)
@@ -516,7 +569,7 @@ class LogManagerTest {
   }
 
   private def readLog(log: UnifiedLog, offset: Long, maxLength: Int = 1024): FetchDataInfo = {
-    log.read(offset, maxLength, isolation = FetchLogEnd, minOneMessage = true)
+    log.read(offset, maxLength, isolation = FetchIsolation.LOG_END, minOneMessage = true)
   }
 
   /**
@@ -617,7 +670,7 @@ class LogManagerTest {
     val tp1 = new TopicPartition(topic, 1)
 
     val oldProperties = new Properties()
-    oldProperties.put(LogConfig.CleanupPolicyProp, LogConfig.Compact)
+    oldProperties.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT)
     val oldLogConfig = LogConfig.fromProps(logConfig.originals, oldProperties)
 
     val log0 = spyLogManager.getOrCreateLog(tp0, topicId = None)
@@ -628,9 +681,9 @@ class LogManagerTest {
     assertEquals(Set(log0, log1), spyLogManager.logsByTopic(topic).toSet)
 
     val newProperties = new Properties()
-    newProperties.put(LogConfig.CleanupPolicyProp, LogConfig.Delete)
+    newProperties.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE)
 
-    spyLogManager.updateTopicConfig(topic, newProperties)
+    spyLogManager.updateTopicConfig(topic, newProperties, false)
 
     assertTrue(log0.config.delete)
     assertTrue(log1.config.delete)
@@ -661,7 +714,7 @@ class LogManagerTest {
     val segmentBytes = 1024
 
     val log = LogTestUtils.createLog(tpFile, logConfig, brokerTopicStats, time.scheduler, time, 0, 0,
-      5 * 60 * 1000, new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs), kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs)
+      5 * 60 * 1000, new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs, false), kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs)
 
     assertTrue(expectedSegmentsPerLog > 0)
     // calculate numMessages to append to logs. It'll create "expectedSegmentsPerLog" log segments with segment.bytes=1024
@@ -678,10 +731,10 @@ class LogManagerTest {
   }
 
   private def verifyRemainingLogsToRecoverMetric(spyLogManager: LogManager, expectedParams: Map[String, Int]): Unit = {
-    val spyLogManagerClassName = spyLogManager.getClass().getSimpleName
+    val logManagerClassName = classOf[LogManager].getSimpleName
     // get all `remainingLogsToRecover` metrics
     val logMetrics: ArrayBuffer[Gauge[Int]] = KafkaYammerMetrics.defaultRegistry.allMetrics.asScala
-      .filter { case (metric, _) => metric.getType == s"$spyLogManagerClassName" && metric.getName == "remainingLogsToRecover" }
+      .filter { case (metric, _) => metric.getType == s"$logManagerClassName" && metric.getName == "remainingLogsToRecover" }
       .map { case (_, gauge) => gauge }
       .asInstanceOf[ArrayBuffer[Gauge[Int]]]
 
@@ -708,10 +761,10 @@ class LogManagerTest {
                                                      recoveryThreadsPerDataDir: Int,
                                                      mockMap: ConcurrentHashMap[String, Int],
                                                      expectedParams: Map[String, Int]): Unit = {
-    val spyLogManagerClassName = spyLogManager.getClass().getSimpleName
+    val logManagerClassName = classOf[LogManager].getSimpleName
     // get all `remainingSegmentsToRecover` metrics
     val logSegmentMetrics: ArrayBuffer[Gauge[Int]] = KafkaYammerMetrics.defaultRegistry.allMetrics.asScala
-          .filter { case (metric, _) => metric.getType == s"$spyLogManagerClassName" && metric.getName == "remainingSegmentsToRecover" }
+          .filter { case (metric, _) => metric.getType == s"$logManagerClassName" && metric.getName == "remainingSegmentsToRecover" }
           .map { case (_, gauge) => gauge }
           .asInstanceOf[ArrayBuffer[Gauge[Int]]]
 
@@ -796,7 +849,7 @@ class LogManagerTest {
         logStartOffset = 0,
         recoveryPoint = 0,
         maxTransactionTimeoutMs = 5 * 60 * 1000,
-        producerStateManagerConfig = new ProducerStateManagerConfig(5 * 60 * 1000),
+        producerStateManagerConfig = new ProducerStateManagerConfig(5 * 60 * 1000, false),
         producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs,
         scheduler = mockTime.scheduler,
         time = mockTime,
