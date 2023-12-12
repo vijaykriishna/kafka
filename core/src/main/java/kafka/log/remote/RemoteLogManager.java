@@ -19,7 +19,6 @@ package kafka.log.remote;
 import com.yammer.metrics.core.Gauge;
 import kafka.cluster.EndPoint;
 import kafka.cluster.Partition;
-import kafka.log.LogSegment;
 import kafka.log.UnifiedLog;
 import kafka.server.BrokerTopicStats;
 import kafka.server.KafkaConfig;
@@ -42,6 +41,7 @@ import org.apache.kafka.common.utils.KafkaThread;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.server.common.OffsetAndEpoch;
 import org.apache.kafka.server.log.remote.metadata.storage.ClassLoaderAwareRemoteLogMetadataManager;
 import org.apache.kafka.server.log.remote.storage.ClassLoaderAwareRemoteStorageManager;
 import org.apache.kafka.server.log.remote.storage.LogSegmentData;
@@ -62,6 +62,7 @@ import org.apache.kafka.storage.internals.log.EpochEntry;
 import org.apache.kafka.storage.internals.log.FetchDataInfo;
 import org.apache.kafka.storage.internals.log.FetchIsolation;
 import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
+import org.apache.kafka.storage.internals.log.LogSegment;
 import org.apache.kafka.storage.internals.log.OffsetIndex;
 import org.apache.kafka.storage.internals.log.OffsetPosition;
 import org.apache.kafka.storage.internals.log.RemoteIndexCache;
@@ -83,7 +84,6 @@ import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
-import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -156,12 +156,11 @@ public class RemoteLogManager implements Closeable {
     // topic ids that are received on leadership changes, this map is cleared on stop partitions
     private final ConcurrentMap<TopicPartition, Uuid> topicIdByPartitionMap = new ConcurrentHashMap<>();
     private final String clusterId;
+    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(this.getClass());
 
     // The endpoint for remote log metadata manager to connect to
     private Optional<EndPoint> endpoint = Optional.empty();
     private boolean closed = false;
-
-    private KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(this.getClass());
 
     /**
      * Creates RemoteLogManager instance with the given arguments.
@@ -194,7 +193,7 @@ public class RemoteLogManager implements Closeable {
 
         remoteLogStorageManager = createRemoteStorageManager();
         remoteLogMetadataManager = createRemoteLogMetadataManager();
-        indexCache = new RemoteIndexCache(1024, remoteLogStorageManager, logDir);
+        indexCache = new RemoteIndexCache(rlmConfig.remoteLogIndexFileCacheTotalSizeBytes(), remoteLogStorageManager, logDir);
         delayInMs = rlmConfig.remoteLogManagerTaskIntervalMs();
         rlmScheduledThreadPool = new RLMScheduledThreadPool(rlmConfig.remoteLogManagerThreadPoolSize());
 
@@ -210,6 +209,10 @@ public class RemoteLogManager implements Closeable {
                 rlmConfig.remoteLogReaderThreads(),
                 rlmConfig.remoteLogReaderMaxPendingTasks()
         );
+    }
+
+    public void resizeCacheSize(long remoteLogIndexFileCacheSize) {
+        indexCache.resizeCacheSize(remoteLogIndexFileCacheSize);
     }
 
     private void removeMetrics() {
@@ -228,7 +231,7 @@ public class RemoteLogManager implements Closeable {
     }
 
     RemoteStorageManager createRemoteStorageManager() {
-        return AccessController.doPrivileged(new PrivilegedAction<RemoteStorageManager>() {
+        return java.security.AccessController.doPrivileged(new PrivilegedAction<RemoteStorageManager>() {
             private final String classPath = rlmConfig.remoteStorageManagerClassPath();
 
             public RemoteStorageManager run() {
@@ -250,7 +253,7 @@ public class RemoteLogManager implements Closeable {
     }
 
     RemoteLogMetadataManager createRemoteLogMetadataManager() {
-        return AccessController.doPrivileged(new PrivilegedAction<RemoteLogMetadataManager>() {
+        return java.security.AccessController.doPrivileged(new PrivilegedAction<RemoteLogMetadataManager>() {
             private final String classPath = rlmConfig.remoteLogMetadataManagerClassPath();
 
             public RemoteLogMetadataManager run() {
@@ -363,9 +366,6 @@ public class RemoteLogManager implements Closeable {
         for (StopPartition stopPartition: stopPartitions) {
             TopicPartition tp = stopPartition.topicPartition();
             try {
-                // We are assuming that if the topic exists in topicIdByPartitionMap then it has active archival
-                // otherwise not. Ideally, `stopPartitions` should not be called for internal and non-tiered-storage
-                // topics. See KAFKA-15432 for more details.
                 if (topicIdByPartitionMap.containsKey(tp)) {
                     TopicIdPartition tpId = new TopicIdPartition(topicIdByPartitionMap.get(tp), tp);
                     RLMTaskWithFuture task = leaderOrFollowerTasks.remove(tpId);
@@ -377,6 +377,8 @@ public class RemoteLogManager implements Closeable {
                         LOGGER.info("Deleting the remote log segments task for partition: {}", tpId);
                         deleteRemoteLogPartition(tpId);
                     }
+                } else {
+                    LOGGER.warn("StopPartition call is not expected for partition: {}", tp);
                 }
             } catch (Exception ex) {
                 errorHandler.accept(tp, ex);
@@ -514,11 +516,15 @@ public class RemoteLogManager implements Closeable {
         while (maybeEpoch.isPresent()) {
             int epoch = maybeEpoch.getAsInt();
 
+            // KAFKA-15802: Add a new API for RLMM to choose how to implement the predicate.
+            // currently, all segments are returned and then iterated, and filtered
             Iterator<RemoteLogSegmentMetadata> iterator = remoteLogMetadataManager.listRemoteLogSegments(topicIdPartition, epoch);
             while (iterator.hasNext()) {
                 RemoteLogSegmentMetadata rlsMetadata = iterator.next();
-                if (rlsMetadata.maxTimestampMs() >= timestamp && rlsMetadata.endOffset() >= startingOffset &&
-                        isRemoteSegmentWithinLeaderEpochs(rlsMetadata, unifiedLog.logEndOffset(), epochWithOffsets)) {
+                if (rlsMetadata.maxTimestampMs() >= timestamp
+                    && rlsMetadata.endOffset() >= startingOffset
+                    && isRemoteSegmentWithinLeaderEpochs(rlsMetadata, unifiedLog.logEndOffset(), epochWithOffsets)
+                    && rlsMetadata.state().equals(RemoteLogSegmentState.COPY_SEGMENT_FINISHED)) {
                     return lookupTimestamp(rlsMetadata, timestamp, startingOffset);
                 }
             }
@@ -561,7 +567,6 @@ public class RemoteLogManager implements Closeable {
             }
             cache.truncateFromEnd(endOffset);
         }
-
         return checkpoint;
     }
 
@@ -586,7 +591,7 @@ public class RemoteLogManager implements Closeable {
 
         // The copied and log-start offset is empty initially for a new leader RLMTask, and needs to be fetched inside
         // the task's run() method.
-        private volatile OptionalLong copiedOffsetOption = OptionalLong.empty();
+        private volatile Optional<OffsetAndEpoch> copiedOffsetOption = Optional.empty();
         private volatile boolean isLogStartOffsetUpdatedOnBecomingLeader = false;
 
         public void convertToLeader(int leaderEpochVal) {
@@ -597,7 +602,7 @@ public class RemoteLogManager implements Closeable {
                 leaderEpoch = leaderEpochVal;
             }
             // Reset copied and log-start offset, so that it is set in next run of RLMTask
-            copiedOffsetOption = OptionalLong.empty();
+            copiedOffsetOption = Optional.empty();
             isLogStartOffsetUpdatedOnBecomingLeader = false;
         }
 
@@ -621,9 +626,10 @@ public class RemoteLogManager implements Closeable {
                 // of a segment with that epoch copied into remote storage. If it can not find an entry then it checks for the
                 // previous leader epoch till it finds an entry, If there are no entries till the earliest leader epoch in leader
                 // epoch cache then it starts copying the segments from the earliest epoch entry's offset.
-                copiedOffsetOption = OptionalLong.of(findHighestRemoteOffset(topicIdPartition, log));
+                copiedOffsetOption = Optional.of(findHighestRemoteOffset(topicIdPartition, log));
                 logger.info("Found the highest copiedRemoteOffset: {} for partition: {} after becoming leader, " +
                                 "leaderEpoch: {}", copiedOffsetOption, topicIdPartition, leaderEpoch);
+                copiedOffsetOption.ifPresent(offsetAndEpoch ->  log.updateHighestOffsetInRemoteStorage(offsetAndEpoch.offset()));
             }
         }
 
@@ -660,7 +666,7 @@ public class RemoteLogManager implements Closeable {
             try {
                 maybeUpdateLogStartOffsetOnBecomingLeader(log);
                 maybeUpdateCopiedOffset(log);
-                long copiedOffset = copiedOffsetOption.getAsLong();
+                long copiedOffset = copiedOffsetOption.get().offset();
 
                 // LSO indicates the offset below are ready to be consumed (high-watermark or committed)
                 long lso = log.lastStableOffset();
@@ -706,7 +712,8 @@ public class RemoteLogManager implements Closeable {
             }
         }
 
-        private void copyLogSegment(UnifiedLog log, LogSegment segment, long nextSegmentBaseOffset) throws InterruptedException, ExecutionException, RemoteStorageException, IOException,
+        private void copyLogSegment(UnifiedLog log, LogSegment segment, long nextSegmentBaseOffset)
+                throws InterruptedException, ExecutionException, RemoteStorageException, IOException,
                 CustomMetadataSizeLimitExceededException {
             File logFile = segment.log().file();
             String logFileName = logFile.getName();
@@ -728,8 +735,8 @@ public class RemoteLogManager implements Closeable {
             remoteLogMetadataManager.addRemoteLogSegmentMetadata(copySegmentStartedRlsm).get();
 
             ByteBuffer leaderEpochsIndex = getLeaderEpochCheckpoint(log, -1, nextSegmentBaseOffset).readAsByteBuffer();
-            LogSegmentData segmentData = new LogSegmentData(logFile.toPath(), toPathIfExists(segment.lazyOffsetIndex().get().file()),
-                    toPathIfExists(segment.lazyTimeIndex().get().file()), Optional.ofNullable(toPathIfExists(segment.txnIndex().file())),
+            LogSegmentData segmentData = new LogSegmentData(logFile.toPath(), toPathIfExists(segment.offsetIndex().file()),
+                    toPathIfExists(segment.timeIndex().file()), Optional.ofNullable(toPathIfExists(segment.txnIndex().file())),
                     producerStateSnapshotFile.toPath(), leaderEpochsIndex);
             brokerTopicStats.topicStats(log.topicPartition().topic()).remoteCopyRequestRate().mark();
             brokerTopicStats.allTopicsStats().remoteCopyRequestRate().mark();
@@ -762,7 +769,11 @@ public class RemoteLogManager implements Closeable {
             brokerTopicStats.topicStats(log.topicPartition().topic())
                 .remoteCopyBytesRate().mark(copySegmentStartedRlsm.segmentSizeInBytes());
             brokerTopicStats.allTopicsStats().remoteCopyBytesRate().mark(copySegmentStartedRlsm.segmentSizeInBytes());
-            copiedOffsetOption = OptionalLong.of(endOffset);
+
+            // `epochEntries` cannot be empty, there is a pre-condition validation in RemoteLogSegmentMetadata
+            // constructor
+            int lastEpochInSegment = epochEntries.get(epochEntries.size() - 1).epoch;
+            copiedOffsetOption = Optional.of(new OffsetAndEpoch(endOffset, lastEpochInSegment));
             // Update the highest offset in remote storage for this partition's log so that the local log segments
             // are not deleted before they are copied to remote storage.
             log.updateHighestOffsetInRemoteStorage(endOffset);
@@ -791,10 +802,10 @@ public class RemoteLogManager implements Closeable {
                     // Cleanup/delete expired remote log segments
                     cleanupExpiredRemoteLogSegments();
                 } else {
-                    long offset = findHighestRemoteOffset(topicIdPartition, log);
+                    OffsetAndEpoch offsetAndEpoch = findHighestRemoteOffset(topicIdPartition, log);
                     // Update the highest offset in remote storage for this partition's log so that the local log segments
                     // are not deleted before they are copied to remote storage.
-                    log.updateHighestOffsetInRemoteStorage(offset);
+                    log.updateHighestOffsetInRemoteStorage(offsetAndEpoch.offset());
                 }
             } catch (InterruptedException ex) {
                 if (!isCancelled()) {
@@ -832,13 +843,11 @@ public class RemoteLogManager implements Closeable {
                 remainingBreachedSize = retentionSizeData.map(sizeData -> sizeData.remainingBreachedSize).orElse(0L);
             }
 
-            private boolean deleteRetentionSizeBreachedSegments(RemoteLogSegmentMetadata metadata) {
-                if (!retentionSizeData.isPresent()) {
-                    return false;
-                }
-
+            private boolean isSegmentBreachedByRetentionSize(RemoteLogSegmentMetadata metadata) {
                 boolean shouldDeleteSegment = false;
-
+                if (!retentionSizeData.isPresent()) {
+                    return shouldDeleteSegment;
+                }
                 // Assumption that segments contain size >= 0
                 if (remainingBreachedSize > 0) {
                     long remainingBytes = remainingBreachedSize - metadata.segmentSizeInBytes();
@@ -847,7 +856,6 @@ public class RemoteLogManager implements Closeable {
                         shouldDeleteSegment = true;
                     }
                 }
-
                 if (shouldDeleteSegment) {
                     logStartOffset = OptionalLong.of(metadata.endOffset() + 1);
                     logger.info("About to delete remote log segment {} due to retention size {} breach. Log size after deletion will be {}.",
@@ -856,12 +864,12 @@ public class RemoteLogManager implements Closeable {
                 return shouldDeleteSegment;
             }
 
-            public boolean deleteRetentionTimeBreachedSegments(RemoteLogSegmentMetadata metadata) {
+            public boolean isSegmentBreachedByRetentionTime(RemoteLogSegmentMetadata metadata) {
+                boolean shouldDeleteSegment = false;
                 if (!retentionTimeData.isPresent()) {
-                    return false;
+                    return shouldDeleteSegment;
                 }
-
-                boolean shouldDeleteSegment = metadata.maxTimestampMs() <= retentionTimeData.get().cleanupUntilMs;
+                shouldDeleteSegment = metadata.maxTimestampMs() <= retentionTimeData.get().cleanupUntilMs;
                 if (shouldDeleteSegment) {
                     remainingBreachedSize = Math.max(0, remainingBreachedSize - metadata.segmentSizeInBytes());
                     // It is fine to have logStartOffset as `metadata.endOffset() + 1` as the segment offset intervals
@@ -873,9 +881,9 @@ public class RemoteLogManager implements Closeable {
                 return shouldDeleteSegment;
             }
 
-            private boolean deleteLogStartOffsetBreachedSegments(RemoteLogSegmentMetadata metadata,
-                                                                 long logStartOffset,
-                                                                 NavigableMap<Integer, Long> leaderEpochEntries) {
+            private boolean isSegmentBreachByLogStartOffset(RemoteLogSegmentMetadata metadata,
+                                                            long logStartOffset,
+                                                            NavigableMap<Integer, Long> leaderEpochEntries) {
                 boolean shouldDeleteSegment = false;
                 if (!leaderEpochEntries.isEmpty()) {
                     // Note that `logStartOffset` and `leaderEpochEntries.firstEntry().getValue()` should be same
@@ -916,10 +924,8 @@ public class RemoteLogManager implements Closeable {
                     remoteLogMetadataManager.updateRemoteLogSegmentMetadata(
                             new RemoteLogSegmentMetadataUpdate(segmentMetadata.remoteLogSegmentId(), time.milliseconds(),
                                     segmentMetadata.customMetadata(), RemoteLogSegmentState.DELETE_SEGMENT_STARTED, brokerId)).get();
-
                     // Delete the segment in remote storage.
                     remoteLogStorageManager.deleteLogSegmentData(segmentMetadata);
-
                     // Publish delete segment finished event.
                     remoteLogMetadataManager.updateRemoteLogSegmentMetadata(
                             new RemoteLogSegmentMetadataUpdate(segmentMetadata.remoteLogSegmentId(), time.milliseconds(),
@@ -932,7 +938,7 @@ public class RemoteLogManager implements Closeable {
 
         }
 
-        private void cleanupExpiredRemoteLogSegments() throws RemoteStorageException, ExecutionException, InterruptedException {
+        void cleanupExpiredRemoteLogSegments() throws RemoteStorageException, ExecutionException, InterruptedException {
             if (isCancelled() || !isLeader()) {
                 logger.info("Returning from remote log segments cleanup as the task state is changed");
                 return;
@@ -994,12 +1000,18 @@ public class RemoteLogManager implements Closeable {
                     }
                     RemoteLogSegmentMetadata metadata = segmentsIterator.next();
 
+                    if (RemoteLogSegmentState.DELETE_SEGMENT_FINISHED.equals(metadata.state())) {
+                        continue;
+                    }
+                    if (segmentsToDelete.contains(metadata)) {
+                        continue;
+                    }
                     // When the log-start-offset is moved by the user, the leader-epoch-checkpoint file gets truncated
                     // as per the log-start-offset. Until the rlm-cleaner-thread runs in the next iteration, those
                     // remote log segments won't be removed. The `isRemoteSegmentWithinLeaderEpoch` validates whether
                     // the epochs present in the segment lies in the checkpoint file. It will always return false
                     // since the checkpoint file was already truncated.
-                    boolean shouldDeleteSegment = remoteLogRetentionHandler.deleteLogStartOffsetBreachedSegments(
+                    boolean shouldDeleteSegment = remoteLogRetentionHandler.isSegmentBreachByLogStartOffset(
                             metadata, logStartOffset, epochWithOffsets);
                     boolean isValidSegment = false;
                     if (!shouldDeleteSegment) {
@@ -1007,8 +1019,8 @@ public class RemoteLogManager implements Closeable {
                         isValidSegment = isRemoteSegmentWithinLeaderEpochs(metadata, logEndOffset, epochWithOffsets);
                         if (isValidSegment) {
                             shouldDeleteSegment =
-                                    remoteLogRetentionHandler.deleteRetentionTimeBreachedSegments(metadata) ||
-                                            remoteLogRetentionHandler.deleteRetentionSizeBreachedSegments(metadata);
+                                    remoteLogRetentionHandler.isSegmentBreachedByRetentionTime(metadata) ||
+                                            remoteLogRetentionHandler.isSegmentBreachedByRetentionSize(metadata);
                         }
                     }
                     if (shouldDeleteSegment) {
@@ -1016,6 +1028,27 @@ public class RemoteLogManager implements Closeable {
                     }
                     canProcess = shouldDeleteSegment || !isValidSegment;
                 }
+            }
+
+            // Update log start offset with the computed value after retention cleanup is done
+            remoteLogRetentionHandler.logStartOffset.ifPresent(offset -> handleLogStartOffsetUpdate(topicIdPartition.topicPartition(), offset));
+
+            // At this point in time we have updated the log start offsets, but not initiated a deletion.
+            // Either a follower has picked up the changes to the log start offset, or they have not.
+            // If the follower HAS picked up the changes, and they become the leader this replica won't successfully complete
+            // the deletion.
+            // However, the new leader will correctly pick up all breaching segments as log start offset breaching ones
+            // and delete them accordingly.
+            // If the follower HAS NOT picked up the changes, and they become the leader then they will go through this process
+            // again and delete them with the original deletion reason i.e. size, time or log start offset breach.
+            List<String> undeletedSegments = new ArrayList<>();
+            for (RemoteLogSegmentMetadata segmentMetadata : segmentsToDelete) {
+                if (!remoteLogRetentionHandler.deleteRemoteLogSegment(segmentMetadata, x -> !isCancelled() && isLeader())) {
+                    undeletedSegments.add(segmentMetadata.remoteLogSegmentId().toString());
+                }
+            }
+            if (!undeletedSegments.isEmpty()) {
+                logger.info("The following remote segments could not be deleted: {}", String.join(",", undeletedSegments));
             }
 
             // Remove the remote log segments whose segment-leader-epochs are less than the earliest-epoch known
@@ -1039,27 +1072,6 @@ public class RemoteLogManager implements Closeable {
                         remoteLogRetentionHandler.deleteLogSegmentsDueToLeaderEpochCacheTruncation(earliestEpochEntry, segmentsToBeCleaned.next());
                     }
                 }
-            }
-
-            // Update log start offset with the computed value after retention cleanup is done
-            remoteLogRetentionHandler.logStartOffset.ifPresent(offset -> handleLogStartOffsetUpdate(topicIdPartition.topicPartition(), offset));
-
-            // At this point in time we have updated the log start offsets, but not initiated a deletion.
-            // Either a follower has picked up the changes to the log start offset, or they have not.
-            // If the follower HAS picked up the changes, and they become the leader this replica won't successfully complete
-            // the deletion.
-            // However, the new leader will correctly pick up all breaching segments as log start offset breaching ones
-            // and delete them accordingly.
-            // If the follower HAS NOT picked up the changes, and they become the leader then they will go through this process
-            // again and delete them with the original deletion reason i.e. size, time or log start offset breach.
-            List<String> undeletedSegments = new ArrayList<>();
-            for (RemoteLogSegmentMetadata segmentMetadata : segmentsToDelete) {
-                if (!remoteLogRetentionHandler.deleteRemoteLogSegment(segmentMetadata, x -> !isCancelled() && isLeader())) {
-                    undeletedSegments.add(segmentMetadata.remoteLogSegmentId().toString());
-                }
-            }
-            if (!undeletedSegments.isEmpty()) {
-                logger.info("The following remote segments could not be deleted: {}", String.join(",", undeletedSegments));
             }
         }
 
@@ -1179,7 +1191,12 @@ public class RemoteLogManager implements Closeable {
             }
         }
         // segment end offset should be with in the log end offset.
-        return segmentEndOffset < logEndOffset;
+        if (segmentEndOffset >= logEndOffset) {
+            LOGGER.debug("Segment {} end offset {} is more than log end offset {}.",
+                    segmentMetadata.remoteLogSegmentId(), segmentEndOffset, logEndOffset);
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -1314,7 +1331,8 @@ public class RemoteLogManager implements Closeable {
         }
     }
 
-    private int lookupPositionForOffset(RemoteLogSegmentMetadata remoteLogSegmentMetadata, long offset) {
+    // Visible for testing
+    int lookupPositionForOffset(RemoteLogSegmentMetadata remoteLogSegmentMetadata, long offset) {
         return indexCache.lookupOffset(remoteLogSegmentMetadata, offset);
     }
 
@@ -1366,7 +1384,7 @@ public class RemoteLogManager implements Closeable {
         }
 
         // Search in local segments
-        collectAbortedTransactionInLocalSegments(startOffset, upperBoundOffset, accumulator, JavaConverters.asJavaIterator(log.logSegments().iterator()));
+        collectAbortedTransactionInLocalSegments(startOffset, upperBoundOffset, accumulator, log.logSegments().iterator());
     }
 
     private void collectAbortedTransactionInLocalSegments(long startOffset,
@@ -1398,7 +1416,8 @@ public class RemoteLogManager implements Closeable {
                 : Optional.empty();
     }
 
-    private RecordBatch findFirstBatch(RemoteLogInputStream remoteLogInputStream, long offset) throws IOException {
+    // Visible for testing
+    RecordBatch findFirstBatch(RemoteLogInputStream remoteLogInputStream, long offset) throws IOException {
         RecordBatch nextBatch;
         // Look for the batch which has the desired offset
         // We will always have a batch in that segment as it is a non-compacted topic.
@@ -1409,20 +1428,37 @@ public class RemoteLogManager implements Closeable {
         return nextBatch;
     }
 
-    long findHighestRemoteOffset(TopicIdPartition topicIdPartition, UnifiedLog log) throws RemoteStorageException {
-        Optional<Long> offset = Optional.empty();
-
-        Option<LeaderEpochFileCache> maybeLeaderEpochFileCache = log.leaderEpochCache();
-        if (maybeLeaderEpochFileCache.isDefined()) {
-            LeaderEpochFileCache cache = maybeLeaderEpochFileCache.get();
-            OptionalInt epoch = cache.latestEpoch();
-            while (!offset.isPresent() && epoch.isPresent()) {
-                offset = remoteLogMetadataManager.highestOffsetForEpoch(topicIdPartition, epoch.getAsInt());
-                epoch = cache.previousEpoch(epoch.getAsInt());
+    OffsetAndEpoch findHighestRemoteOffset(TopicIdPartition topicIdPartition, UnifiedLog log) throws RemoteStorageException {
+        OffsetAndEpoch offsetAndEpoch = null;
+        Option<LeaderEpochFileCache> leaderEpochCacheOpt = log.leaderEpochCache();
+        if (leaderEpochCacheOpt.isDefined()) {
+            LeaderEpochFileCache cache = leaderEpochCacheOpt.get();
+            Optional<EpochEntry> maybeEpochEntry = cache.latestEntry();
+            while (offsetAndEpoch == null && maybeEpochEntry.isPresent()) {
+                int epoch = maybeEpochEntry.get().epoch;
+                Optional<Long> highestRemoteOffsetOpt =
+                        remoteLogMetadataManager.highestOffsetForEpoch(topicIdPartition, epoch);
+                if (highestRemoteOffsetOpt.isPresent()) {
+                    Map.Entry<Integer, Long> entry = cache.endOffsetFor(epoch, log.logEndOffset());
+                    int requestedEpoch = entry.getKey();
+                    long endOffset = entry.getValue();
+                    long highestRemoteOffset = highestRemoteOffsetOpt.get();
+                    if (endOffset <= highestRemoteOffset) {
+                        LOGGER.info("The end-offset for epoch {}: ({}, {}) is less than or equal to the " +
+                                "highest-remote-offset: {} for partition: {}", epoch, requestedEpoch, endOffset,
+                                highestRemoteOffset, topicIdPartition);
+                        offsetAndEpoch = new OffsetAndEpoch(endOffset - 1, requestedEpoch);
+                    } else {
+                        offsetAndEpoch = new OffsetAndEpoch(highestRemoteOffset, epoch);
+                    }
+                }
+                maybeEpochEntry = cache.previousEntry(epoch);
             }
         }
-
-        return offset.orElse(-1L);
+        if (offsetAndEpoch == null) {
+            offsetAndEpoch = new OffsetAndEpoch(-1L, RecordBatch.NO_PARTITION_LEADER_EPOCH);
+        }
+        return offsetAndEpoch;
     }
 
     long findLogStartOffset(TopicIdPartition topicIdPartition, UnifiedLog log) throws RemoteStorageException {
@@ -1654,5 +1690,4 @@ public class RemoteLogManager implements Closeable {
                     '}';
         }
     }
-
 }
